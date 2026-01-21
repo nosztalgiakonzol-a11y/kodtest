@@ -193,20 +193,19 @@ NAV_STABLE_AFTER_EXIT = 0.42 # ha kimentünk NAV-ról, ennyit várunk stabilan
 
 # --- BOOTSTRAP FÁZIS: indulás után X másodpercig csak tabnyitás + ID-gyűjtés ---
 RUN_STARTED_AT = 0.0        # induláskor beállítjuk __main__-ben
-BOOTSTRAP_SEC = 50.0        # ennyi másodpercig megy a "csak nyitunk mindent" fázis
+BOOTSTRAP_SEC = 50.0        # legacy, not used in dynamic mode
 BOOTSTRAP_CLEANUP_DONE = False  # jelzi, hogy a post-bootstrap cleanup már lefutott-e
+BOOTSTRAP_COMPLETED = False      # jelzi, hogy a dinamikus bootstrap befejeződött
 
 def in_bootstrap_phase() -> bool:
     """
-    True: az első BOOTSTRAP_SEC másodpercben a script indulásától.
+    True: amíg a dinamikus bootstrap fut (BOOTSTRAP_COMPLETED == False).
     Ezalatt:
       - NINCS SAVE / UPDATE / DELETE Supabase felé
       - NINCS NAV worker
       - csak main/group/next oldalak nyitása + tbody ID gyűjtés történik
     """
-    if RUN_STARTED_AT <= 0:
-        return True
-    return (time.time() - RUN_STARTED_AT) < BOOTSTRAP_SEC
+    return not BOOTSTRAP_COMPLETED
 
 # --- ACTIVE / GONE ---
 ACTIVE_FILE = "active_ids.txt"
@@ -1987,8 +1986,9 @@ def resolve_pairs_round_robin(pairs) -> tuple[list[tuple[str | None, str | None]
                 pass
 
     total = time.time() - t0
+    num_successful = sum(1 for done in done_pairs if done)
     log(
-        f"resolve_pairs_round_robin(streaming): {num_pairs_to_open} pár, "
+        f"resolve_pairs_round_robin(streaming): {num_pairs_to_open} pár, sikeres={num_successful}, "
         f"open={open_elapsed:.3f}s, total={total:.3f}s, timeout={PAIR_TIMEOUT_SEC:.1f}s"
     )
 
@@ -3917,6 +3917,134 @@ def post_bootstrap_cleanup():
     log("🏁 POST-BOOTSTRAP CLEANUP kész – normál működés folytatódik")
 
 
+def run_dynamic_bootstrap():
+    """
+    Dinamikus BOOTSTRAP fázis:
+    1. MAIN + rekurzív NEXT oldalak megnyitása (max 20s)
+    2. GROUP linkek gyűjtése + párhuzamos megnyitás
+    3. 10s várakozás GROUP oldalak betöltésére
+    4. Max 5 perc az egész folyamatra
+    """
+    global BOOTSTRAP_COMPLETED, MAIN_HANDLE
+    
+    bootstrap_start = time.time()
+    MAX_BOOTSTRAP_TIME = 300  # 5 perc
+    NEXT_PHASE_TIMEOUT = 20   # 20s MAIN + NEXT oldalakra
+    GROUP_LOAD_WAIT = 10      # 10s GROUP oldalak betöltésére
+    
+    log("🚀 DINAMIKUS BOOTSTRAP indul: MAIN + NEXT oldalak rekurzív feltérképezése")
+    
+    try:
+        # === FÁZIS 1: MAIN + rekurzív NEXT oldalak (max 20s) ===
+        phase1_start = time.time()
+        next_urls_to_open = []
+        
+        # MAIN oldal szkennelése NEXT linkekért
+        try:
+            if MAIN_HANDLE and MAIN_HANDLE in driver.window_handles:
+                driver.switch_to.window(MAIN_HANDLE)
+                next_link = find_next_page_link()
+                if next_link and next_link not in next_tabs:
+                    next_urls_to_open.append(next_link)
+                    log(f"📄 MAIN-ról talált NEXT: {next_link}")
+        except Exception as e:
+            warn(f"⚠️ MAIN scan hiba (NEXT linkek): {e}")
+        
+        # Rekurzívan nyitjuk a NEXT oldalakat és keressük a további NEXT linkeket
+        opened_next = set()
+        while next_urls_to_open and (time.time() - phase1_start) < NEXT_PHASE_TIMEOUT:
+            next_url = next_urls_to_open.pop(0)
+            if next_url in opened_next or next_url in next_tabs:
+                continue
+            
+            try:
+                open_next_tab_if_needed(next_url)
+                opened_next.add(next_url)
+                
+                # Scan az újonnan megnyitott NEXT oldalon további NEXT linkekért
+                if next_url in next_tabs:
+                    info = next_tabs[next_url]
+                    handle = info.get("handle")
+                    if handle and handle in driver.window_handles:
+                        driver.switch_to.window(handle)
+                        further_next = find_next_page_link()
+                        if further_next and further_next not in opened_next and further_next not in next_tabs:
+                            next_urls_to_open.append(further_next)
+                            log(f"📄 NEXT-ről talált újabb NEXT: {further_next}")
+            except Exception as e:
+                warn(f"⚠️ NEXT oldal megnyitás hiba ({next_url}): {e}")
+        
+        phase1_elapsed = time.time() - phase1_start
+        log(f"✅ FÁZIS 1 kész: {len(opened_next)} NEXT oldal megnyitva ({phase1_elapsed:.1f}s)")
+        
+        # === FÁZIS 2: GROUP linkek gyűjtése + megnyitás ===
+        if (time.time() - bootstrap_start) >= MAX_BOOTSTRAP_TIME:
+            log("⏰ 5 perces timeout – BOOTSTRAP befejezése GROUP fázis nélkül")
+            BOOTSTRAP_COMPLETED = True
+            return
+        
+        log("📦 FÁZIS 2: GROUP linkek gyűjtése MAIN + NEXT oldalakról")
+        group_urls_to_open = set()
+        
+        # MAIN oldalról GROUP linkek
+        try:
+            if MAIN_HANDLE and MAIN_HANDLE in driver.window_handles:
+                driver.switch_to.window(MAIN_HANDLE)
+                tbodys = driver.find_elements(By.CSS_SELECTOR, "tbody.surebet_record")
+                for tbody in tbodys:
+                    try:
+                        group_link = find_group_link_in_tbody(tbody)
+                        if group_link and group_link not in group_tabs:
+                            group_urls_to_open.add(group_link)
+                    except Exception:
+                        pass
+        except Exception as e:
+            warn(f"⚠️ MAIN GROUP linkek gyűjtése hiba: {e}")
+        
+        # NEXT oldalakról GROUP linkek
+        for next_url, info in list(next_tabs.items()):
+            try:
+                handle = info.get("handle")
+                if handle and handle in driver.window_handles:
+                    driver.switch_to.window(handle)
+                    tbodys = driver.find_elements(By.CSS_SELECTOR, "tbody.surebet_record")
+                    for tbody in tbodys:
+                        try:
+                            group_link = find_group_link_in_tbody(tbody)
+                            if group_link and group_link not in group_tabs:
+                                group_urls_to_open.add(group_link)
+                        except Exception:
+                            pass
+            except Exception as e:
+                warn(f"⚠️ NEXT ({next_url}) GROUP linkek gyűjtése hiba: {e}")
+        
+        log(f"📦 {len(group_urls_to_open)} GROUP link megnyitása...")
+        
+        # Párhuzamos GROUP oldal megnyitás
+        for group_url in group_urls_to_open:
+            if (time.time() - bootstrap_start) >= MAX_BOOTSTRAP_TIME:
+                log("⏰ 5 perces timeout – BOOTSTRAP befejezése")
+                break
+            try:
+                open_group_tab_if_needed(group_url)
+            except Exception as e:
+                warn(f"⚠️ GROUP oldal megnyitás hiba ({group_url}): {e}")
+        
+        # === FÁZIS 3: Várakozás GROUP oldalak betöltésére ===
+        if (time.time() - bootstrap_start) < MAX_BOOTSTRAP_TIME:
+            log(f"⏳ {GROUP_LOAD_WAIT}s várakozás GROUP oldalak betöltésére...")
+            time.sleep(GROUP_LOAD_WAIT)
+        
+        total_time = time.time() - bootstrap_start
+        log(f"✅ DINAMIKUS BOOTSTRAP befejezve: {len(opened_next)} NEXT + {len(group_tabs)} GROUP oldal ({total_time:.1f}s)")
+        
+    except Exception as e:
+        warn(f"⚠️ DINAMIKUS BOOTSTRAP hiba: {e}")
+    finally:
+        BOOTSTRAP_COMPLETED = True
+        log("🏁 BOOTSTRAP_COMPLETED = True – normál működés indul")
+
+
 def full_resync_and_cleanup(max_groups=None):
     """
     ÚJ: TAB-ALAPÚ RESYNC
@@ -4014,14 +4142,15 @@ if __name__ == "__main__":
     RUN_STARTED_AT = time.time()
     login()
 
-    log(f"🚀 BOOTSTRAP fázis indul: az első {int(BOOTSTRAP_SEC)} mp-ben "
-        f"csak main/group/next tab nyitás + tbody ID gyűjtés, "
-        f"nincs SAVE/UPDATE/DELETE/NAV.")
+    log("🚀 DINAMIKUS BOOTSTRAP fázis: rekurzív MAIN + NEXT + GROUP oldalak megnyitása")
 
     try:
         MAIN_HANDLE = driver.current_window_handle
     except Exception:
         MAIN_HANDLE = None
+
+    # Dinamikus BOOTSTRAP futtatása
+    run_dynamic_bootstrap()
 
     # NAV worker: csak BOOTSTRAP UTÁN indul
     nav_thread = None
