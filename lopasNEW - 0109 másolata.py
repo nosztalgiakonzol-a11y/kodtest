@@ -194,6 +194,7 @@ NAV_STABLE_AFTER_EXIT = 0.42 # ha kimentünk NAV-ról, ennyit várunk stabilan
 # --- BOOTSTRAP FÁZIS: indulás után X másodpercig csak tabnyitás + ID-gyűjtés ---
 RUN_STARTED_AT = 0.0        # induláskor beállítjuk __main__-ben
 BOOTSTRAP_SEC = 50.0        # ennyi másodpercig megy a "csak nyitunk mindent" fázis
+BOOTSTRAP_CLEANUP_DONE = False  # jelzi, hogy a post-bootstrap cleanup már lefutott-e
 
 def in_bootstrap_phase() -> bool:
     """
@@ -3824,6 +3825,64 @@ def collect_live_ids_from_open_tabs() -> set[str]:
     return live_ids
 
 
+def post_bootstrap_cleanup():
+    """
+    BOOTSTRAP fázis után automatikusan lefutó cleanup:
+    - összegyűjti az élő ID-kat a nyitott main/group/next tabokból
+    - összehasonlítja az active_ids fájllal
+    - ami nem látható a weboldalon, törli az active_ids fájlból
+    - és küldi a delete-tip-et a szervernek is
+    
+    Ez minden induláskor lefut, akár user váltásnál is.
+    """
+    global active_ids, BOOTSTRAP_CLEANUP_DONE
+    
+    if BOOTSTRAP_CLEANUP_DONE:
+        return  # már lefutott, ne csináljuk újra
+    
+    log("🧹 POST-BOOTSTRAP CLEANUP indul: ID-k összehasonlítása active_ids fájllal...")
+    
+    try:
+        # Összegyűjtjük az élő ID-kat a nyitott tabokból
+        live_ids = collect_live_ids_from_open_tabs()
+    except Exception as e:
+        warn(f"POST-BOOTSTRAP CLEANUP: hiba az élő ID-k gyűjtésekor: {e}")
+        live_ids = set()
+    
+    # Azonosítjuk a stale ID-kat (amik az active_ids-ben vannak, de nem látszanak)
+    stale_ids = [tid for tid in list(active_ids) if tid not in live_ids]
+    
+    if stale_ids:
+        log(f"🗑️ POST-BOOTSTRAP CLEANUP: {len(stale_ids)} ID nem látható → törlés active_ids fájlból és szerverről")
+        
+        # Törlés az active_ids-ből
+        for tid in stale_ids:
+            active_ids.discard(tid)
+        
+        # Mentés az active_ids fájlba
+        save_active_all(active_ids)
+        
+        # DELETE küldése a szervernek (dispatcher-en keresztül)
+        for tid in stale_ids:
+            try:
+                dispatcher.enqueue_delete(tid)
+            except Exception as e:
+                warn(f"⚠️ DELETE enqueue hiba (post-bootstrap): {e}")
+        
+        # Azonnal kiküldjük a DELETE-eket
+        try:
+            process_dispatcher_results(max_items=2000)
+        except Exception as e:
+            warn(f"⚠️ POST-BOOTSTRAP CLEANUP: dispatcher results hiba: {e}")
+        
+        log(f"✅ POST-BOOTSTRAP CLEANUP: {len(stale_ids)} ID törölve")
+    else:
+        log("✨ POST-BOOTSTRAP CLEANUP: nincs törlendő ID – minden élő ID megtalálható a tabokon")
+    
+    BOOTSTRAP_CLEANUP_DONE = True
+    log("🏁 POST-BOOTSTRAP CLEANUP kész – normál működés folytatódik")
+
+
 def full_resync_and_cleanup(max_groups=None):
     """
     ÚJ: TAB-ALAPÚ RESYNC
@@ -4035,6 +4094,10 @@ if __name__ == "__main__":
                 break
 
             bootstrap = in_bootstrap_phase()
+
+            # 🧹 POST-BOOTSTRAP CLEANUP – csak egyszer, amikor a bootstrap vége van
+            if not bootstrap and not BOOTSTRAP_CLEANUP_DONE:
+                post_bootstrap_cleanup()
 
             # --- SUPABASE dispatcher eredmények ---
             if not bootstrap:
