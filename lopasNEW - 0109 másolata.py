@@ -263,6 +263,9 @@ MAX_BODY_SNIFF = 1200         # ennyi karakterig nézünk bele a body-ba "not fo
 
 HMAP_MAX_SEC = 60  # max ennyi másodpercet engedünk hmap + URL olvasásra
 
+# --- WINDOW CLOSURE COORDINATION ---
+CLOSING_HANDLES = set()  # Ablak handle-ek, amik épp bezáródnak (race condition védelem)
+
 # --- NAV CDP DEBUG (URL figyelés tabváltás nélkül) ---
 DEBUG_NAV_CDP = True          # ha zavar a log, állítsd False-ra
 DEBUG_NAV_CDP_INTERVAL = 2.0  # másodpercenként logoljuk a NAV / külső page targeteket
@@ -2234,48 +2237,63 @@ def background_nav_worker():
 
             # 3) Eredmények feldolgozása
             for idx, task in enumerate(todo):
-                tbody_id = task["id"]
+                try:
+                    tbody_id = task["id"]
 
-                if pairs[idx] is None:
-                    # fallback: ha a pár None volt, de a taskban van két href, próbáljuk külön
-                    h1, h2 = task.get("hrefs") or (None, None)
-                    if h1 and h2:
-                        (f1, f2), (s1, s2) = resolve_two_final_urls_rr(h1, h2)
+                    if pairs[idx] is None:
+                        # fallback: ha a pár None volt, de a taskban van két href, próbáljuk külön
+                        h1, h2 = task.get("hrefs") or (None, None)
+                        if h1 and h2:
+                            (f1, f2), (s1, s2) = resolve_two_final_urls_rr(h1, h2)
+                        else:
+                            f1, f2 = h1, h2
+                            s1, s2 = ("timeout", "timeout")
                     else:
-                        f1, f2 = h1, h2
-                        s1, s2 = ("timeout", "timeout")
-                else:
-                    (f1, f2) = finals[idx]
-                    (s1, s2) = states[idx]
+                        (f1, f2) = finals[idx]
+                        (s1, s2) = states[idx]
 
-                task["finals"] = (f1, f2)
+                    task["finals"] = (f1, f2)
 
-                ok = valid_external(f1) and valid_external(f2)
-                if ok:
-                    tip_payload = _build_tip_payload_from_task(task)
-                    update_payload = _build_update_payload_from_task(task)
-                    dispatcher.enqueue_save({
-                        "id": tbody_id,
-                        "tip_payload": tip_payload,
-                        "update_payload": update_payload,
-                        "state_info": {
-                            "odds1": tip_payload["odds1"],
-                            "odds2": tip_payload["odds2"],
-                            "profit_percent": tip_payload["profit_percent"],
-                        },
-                        "finals": task["finals"],
-                    })
-                    link_cache[tbody_id] = {
-                        "link1": f1,
-                        "link2": f2,
-                        "saved_at": datetime.now().isoformat()
-                    }
-                    _clear_nav_backoff(tbody_id)
-                else:
-                    # minden nem 'ok' (beleértve a timeout-ot) → NAV backoff
-                    if 'not_found' in (s1, s2):
-                        warn(f"🔎 Page not found → NAV backoff: {tbody_id} (s1={s1}, s2={s2})")
-                    _schedule_nav_backoff(tbody_id)
+                    ok = valid_external(f1) and valid_external(f2)
+                    if ok:
+                        tip_payload = _build_tip_payload_from_task(task)
+                        update_payload = _build_update_payload_from_task(task)
+                        dispatcher.enqueue_save({
+                            "id": tbody_id,
+                            "tip_payload": tip_payload,
+                            "update_payload": update_payload,
+                            "state_info": {
+                                "odds1": tip_payload["odds1"],
+                                "odds2": tip_payload["odds2"],
+                                "profit_percent": tip_payload["profit_percent"],
+                            },
+                            "finals": task["finals"],
+                        })
+                        link_cache[tbody_id] = {
+                            "link1": f1,
+                            "link2": f2,
+                            "saved_at": datetime.now().isoformat()
+                        }
+                        _clear_nav_backoff(tbody_id)
+                    else:
+                        # minden nem 'ok' (beleértve a timeout-ot) → NAV backoff
+                        if 'not_found' in (s1, s2):
+                            warn(f"🔎 Page not found → NAV backoff: {tbody_id} (s1={s1}, s2={s2})")
+                        _schedule_nav_backoff(tbody_id)
+
+                except Exception as task_err:
+                    # Ha driver-connection hiba → teljes NAV leáll (propagáljuk)
+                    if _is_driver_connection_error(task_err):
+                        raise
+                    
+                    # Egyéb hiba → task visszarakása queue végére (max 2x retry)
+                    retry_count = task.get("_retry_count", 0)
+                    if retry_count < 2:
+                        task["_retry_count"] = retry_count + 1
+                        OPEN_TASKS.append(task)
+                        warn(f"⚠️ Task feldolgozás hiba, újrapróbálás ({retry_count+1}/2): {task.get('id')} - {task_err}")
+                    else:
+                        warn(f"❌ Task végleg elvetve 2 sikertelen próbálkozás után: {task.get('id')}")
 
             save_link_cache(link_cache)
 
@@ -2441,18 +2459,23 @@ def block_group_url(url, seconds, reason=""):
     log(f"⛔ GROUP tiltólista {seconds}s: {url} ({reason})")
 
 def close_group_tab(url):
+    global CLOSING_HANDLES
     info = group_tabs.get(url)
     if not info:
         return
+    handle = info.get("handle")
+    if handle:
+        CLOSING_HANDLES.add(handle)  # Jelzés, hogy bezárás alatt van
     try:
-        handle = info["handle"]
-        if handle in driver.window_handles:
+        if handle and handle in driver.window_handles:
             driver.switch_to.window(handle)
             driver.close()
     except Exception:
         pass
     finally:
         group_tabs.pop(url, None)
+        if handle:
+            CLOSING_HANDLES.discard(handle)  # Eltávolítás bezárás után
         try:
             if driver.window_handles:
                 driver.switch_to.window(driver.window_handles[0])
@@ -4225,14 +4248,19 @@ if __name__ == "__main__":
             # TABOK BEZÁRÁSA
             for url in next_to_close:
                 info = next_tabs.get(url)
+                handle = info.get("handle") if info else None
+                if handle:
+                    CLOSING_HANDLES.add(handle)  # Jelzés, hogy bezárás alatt van
                 try:
-                    if info and info["handle"] in driver.window_handles:
-                        driver.switch_to.window(info["handle"])
+                    if info and handle and handle in driver.window_handles:
+                        driver.switch_to.window(handle)
                         driver.close()
                 except Exception:
                     pass
                 finally:
                     next_tabs.pop(url, None)
+                    if handle:
+                        CLOSING_HANDLES.discard(handle)  # Eltávolítás bezárás után
                     try:
                         if MAIN_HANDLE and MAIN_HANDLE in driver.window_handles:
                             driver.switch_to.window(MAIN_HANDLE)
