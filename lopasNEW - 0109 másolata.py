@@ -177,7 +177,7 @@ NAV_WORKER_MAX_PAIRS = 11
 PAIR_TIMEOUT_SEC = FIX_URL_WAIT_SEC  # most 20 mp, ugyanaz mint a régi FIX_URL_WAIT_SEC
 
 # Milyen gyakran kérdezzük le CDP-vel a Target.getTargets-et (másodperc)
-CDP_POLL_INTERVAL = 0.15  # 150 ms körül
+CDP_POLL_INTERVAL = 0.20  # 200 ms - csökkenti CPU terhelést és CDP spam-et
 
 # Logoljuk-e, ha egy pár mindkét végső linkje megvan és a pár lezárult
 LOG_PAIR_DONE = True
@@ -1970,10 +1970,21 @@ def resolve_pairs_round_robin(pairs) -> tuple[list[tuple[str | None, str | None]
 
         time.sleep(CDP_POLL_INTERVAL)
 
-    # 3) Timeout után: minden maradék target bezárása (safe CDP)
+    # 3) Timeout után: minden maradék target bezárása (safe CDP + fallback)
     for tid in list(tracking.keys()):
-        _safe_cdp_cmd("Target.closeTarget", {"targetId": tid}, label="RR closeTarget (timeout)")
+        result = _safe_cdp_cmd("Target.closeTarget", {"targetId": tid}, label="RR closeTarget (timeout)")
         tracking.pop(tid, None)
+        
+        # Fallback: ha CDP nem működött, próbáljunk Selenium-level cleanup-ot
+        if result is None:
+            try:
+                current_handles = set(driver.window_handles) if driver else set()
+                # Ha vannak új handleök amiket nem ismerünk, esetleg ezek a timeout-os targetekhez tartoznak
+                # Sajnos targetId → window handle mapping nincs, így csak log-olunk
+                if current_handles:
+                    warn(f"[RR] CDP closeTarget sikertelen tid={tid}, {len(current_handles)} ablak nyitva")
+            except Exception:
+                pass
 
     total = time.time() - t0
     log(
