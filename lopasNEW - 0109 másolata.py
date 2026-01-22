@@ -1992,6 +1992,22 @@ def resolve_pairs_round_robin(pairs) -> tuple[list[tuple[str | None, str | None]
             # Új ablakok amik a target nyitások során keletkeztek
             extra_handles = current_handles - handles_before
             
+            # VÉDELEM: MAIN_HANDLE, GROUP, NEXT tabok SOHA ne legyenek bezárva
+            protected_handles = set()
+            if MAIN_HANDLE and MAIN_HANDLE in extra_handles:
+                protected_handles.add(MAIN_HANDLE)
+                warn(f"[RR] 🛡️ MAIN_HANDLE védelem aktiválva fallback cleanup-ban")
+            for info in group_tabs.values():
+                h = info.get("handle")
+                if h and h in extra_handles:
+                    protected_handles.add(h)
+            for info in next_tabs.values():
+                h = info.get("handle")
+                if h and h in extra_handles:
+                    protected_handles.add(h)
+            
+            extra_handles = extra_handles - protected_handles
+            
             if extra_handles:
                 warn(f"[RR] {len(failed_cdp_closes)} CDP closeTarget sikertelen, {len(extra_handles)} extra ablak – Selenium fallback bezárás")
                 original_handle = driver.current_window_handle if driver.current_window_handle in current_handles else None
@@ -2139,7 +2155,25 @@ def resolve_pairs_staggered(pairs, timeout=RESOLVE_TIMEOUT, stable_period=RESOLV
             created_list = list(cur - prev) if prev else []
         except Exception:
             created_list = []
+        
+        # VÉDELEM: MAIN_HANDLE, GROUP, NEXT tabok SOHA ne legyenek bezárva
+        protected_handles = set()
+        if MAIN_HANDLE and MAIN_HANDLE in created_list:
+            protected_handles.add(MAIN_HANDLE)
+            warn(f"[resolve_all_pairs_streaming] 🛡️ MAIN_HANDLE védelem aktiválva cleanup-ban")
+        for info in group_tabs.values():
+            h = info.get("handle")
+            if h and h in created_list:
+                protected_handles.add(h)
+        for info in next_tabs.values():
+            h = info.get("handle")
+            if h and h in created_list:
+                protected_handles.add(h)
+        
+        # Csak a nem védett handle-eket zárjuk be
         for h in created_list:
+            if h in protected_handles:
+                continue
             try:
                 if h in driver.window_handles:
                     driver.switch_to.window(h)
