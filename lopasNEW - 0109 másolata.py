@@ -4091,9 +4091,11 @@ def run_dynamic_bootstrap():
             except Exception as e:
                 warn(f"⚠️ NEXT ({next_url}) GROUP linkek gyűjtése hiba: {e}")
         
-        log(f"📦 {len(group_urls_to_open)} GROUP link megnyitása...")
+        # === FÁZIS 2b: GROUP oldalak párhuzamos megnyitása ===
+        group_count = len(group_urls_to_open)
+        log(f"🔍 {group_count} GROUP oldal nyitása...")
         
-        # Párhuzamos GROUP oldal megnyitás
+        # Küldés queue-ba (async nyitás)
         for group_url in group_urls_to_open:
             if (time.time() - bootstrap_start) >= MAX_BOOTSTRAP_TIME:
                 log("⏰ 5 perces timeout – BOOTSTRAP befejezése")
@@ -4102,6 +4104,21 @@ def run_dynamic_bootstrap():
                 open_group_tab_if_needed(group_url)
             except Exception as e:
                 warn(f"⚠️ GROUP oldal megnyitás hiba ({group_url}): {e}")
+        
+        # Várunk amíg az összes GROUP oldal megnyílik
+        log(f"⏳ Várakozás hogy mind a {group_count} GROUP oldal megnyíljon...")
+        wait_start = time.time()
+        max_wait_for_opens = 30  # max 30s várunk hogy megnyíljanak
+        
+        while (time.time() - wait_start) < max_wait_for_opens:
+            opened_count = len([url for url in group_urls_to_open if url in group_tabs])
+            if opened_count >= group_count:
+                log(f"✅ Mind a {group_count} GROUP oldal megnyílt")
+                break
+            if (time.time() - bootstrap_start) >= MAX_BOOTSTRAP_TIME:
+                log(f"⏰ 5 perces timeout – {opened_count}/{group_count} GROUP oldal megnyílt")
+                break
+            time.sleep(0.5)  # rövid poll intervallum
         
         # === FÁZIS 3: Várakozás GROUP oldalak betöltésére ===
         if (time.time() - bootstrap_start) < MAX_BOOTSTRAP_TIME:
