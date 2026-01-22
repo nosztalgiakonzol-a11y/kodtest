@@ -265,6 +265,9 @@ HMAP_MAX_SEC = 60  # max ennyi másodpercet engedünk hmap + URL olvasásra
 # --- WINDOW CLOSURE COORDINATION ---
 CLOSING_HANDLES = set()  # Ablak handle-ek, amik épp bezáródnak (race condition védelem)
 
+# --- CDP COORDINATION ---
+PENDING_CDP_CLOSES = {}  # targetId -> bezárás kezdés időpontja (float)
+
 # --- NAV CDP DEBUG (URL figyelés tabváltás nélkül) ---
 DEBUG_NAV_CDP = True          # ha zavar a log, állítsd False-ra
 DEBUG_NAV_CDP_INTERVAL = 2.0  # másodpercenként logoljuk a NAV / külső page targeteket
@@ -610,8 +613,9 @@ def _safe_cdp_cmd(method: str, params: dict | None = None, *, label: str = ""):
     - Ha 'no such window' / 'web view not found' / stb. hibát kapunk → log + None.
     - Ha driver connection error (HTTPConnectionPool / WinError 10061...), akkor DRIVER_DEAD=True,
       és innentől minden cdp hívás skip-el.
+    - Target.closeTarget: duplikált bezárás védelem PENDING_CDP_CLOSES-szal
     """
-    global driver, DRIVER_DEAD
+    global driver, DRIVER_DEAD, PENDING_CDP_CLOSES
 
     if params is None:
         params = {}
@@ -635,10 +639,37 @@ def _safe_cdp_cmd(method: str, params: dict | None = None, *, label: str = ""):
         warn(f"[CDP] {method} skip – nincs window (label={label})")
         return None
 
+    # CDP koordináció: Target.closeTarget duplikált bezárás védelem
+    if method == "Target.closeTarget":
+        target_id = params.get("targetId")
+        if target_id:
+            # Ha már bezárás alatt van, skip
+            if target_id in PENDING_CDP_CLOSES:
+                # Timeout ellenőrzés: ha 5s óta bent van, eltávolítjuk (esetleg lefagyott)
+                if time.time() - PENDING_CDP_CLOSES[target_id] > 5.0:
+                    PENDING_CDP_CLOSES.pop(target_id, None)
+                else:
+                    # Még mindig friss, skip
+                    return None
+            # Regisztráljuk hogy bezárás alatt van
+            PENDING_CDP_CLOSES[target_id] = time.time()
+
     try:
-        return driver.execute_cdp_cmd(method, params)
+        result = driver.execute_cdp_cmd(method, params)
+        # Sikeres bezárás után eltávolítjuk a tracking-ből
+        if method == "Target.closeTarget":
+            target_id = params.get("targetId")
+            if target_id:
+                PENDING_CDP_CLOSES.pop(target_id, None)
+        return result
     except Exception as e:
         msg = str(e).lower()
+
+        # Sikertelen bezárás után is eltávolítjuk (ne maradjon bent)
+        if method == "Target.closeTarget":
+            target_id = params.get("targetId")
+            if target_id:
+                PENDING_CDP_CLOSES.pop(target_id, None)
 
         # ha ez is driver connection error → beállítjuk a flaget
         if _is_driver_connection_error(e):
@@ -646,7 +677,7 @@ def _safe_cdp_cmd(method: str, params: dict | None = None, *, label: str = ""):
             warn(f"[CDP] {method} driver-connection hiba, DRIVER_DEAD=True (label={label}): {e}")
             return None
 
-        # tipikus „ablak megszűnt” hibák
+        # tipikus „ablak megszűnt" hibák
         if (
             "no such window" in msg
             or "web view not found" in msg
@@ -659,6 +690,44 @@ def _safe_cdp_cmd(method: str, params: dict | None = None, *, label: str = ""):
         # egyéb CDP hiba – logoljuk, de nem ölünk meg semmit
         warn(f"[CDP] {method} hiba (label={label}): {e}")
         return None
+
+
+# ---------- CRASH RECOVERY ----------
+def restart_application():
+    """
+    Univerzális crash recovery: újraindítja az alkalmazást.
+    - Tries graceful driver.quit()
+    - Kills Chrome processes as backup
+    - Restarts the script with os.execv()
+    """
+    global driver
+    
+    warn("⚠️ Session crash detected, restarting application...")
+    
+    # Try graceful close
+    try:
+        if driver is not None:
+            driver.quit()
+    except Exception as e:
+        warn(f"driver.quit() failed: {e}")
+    
+    # Backup: Kill Chrome processes
+    try:
+        if platform.system() == "Windows":
+            os.system("taskkill /F /IM chrome.exe /T 2>nul")
+            os.system("taskkill /F /IM chromedriver.exe /T 2>nul")
+        else:
+            os.system("pkill -9 chrome 2>/dev/null")
+            os.system("pkill -9 chromedriver 2>/dev/null")
+    except Exception as e:
+        warn(f"Chrome process kill failed: {e}")
+    
+    # Small delay before restart
+    time.sleep(2)
+    
+    # Restart script
+    warn("🔄 Restarting script...")
+    os.execv(sys.executable, ['python'] + sys.argv)
 
 
 # ---------- URL utilok ----------
@@ -4346,6 +4415,20 @@ if __name__ == "__main__":
                 warn("💀 WebDriver kapcsolat meghalt (DRIVER_DEAD=True) – kilépek a fő ciklusból.")
                 break
 
+            # 🏥 Session health check: gyors window_handles check
+            try:
+                _ = driver.window_handles
+            except WebDriverException as e:
+                msg_lower = str(e).lower()
+                if "invalid session" in msg_lower or "chrome not reachable" in msg_lower:
+                    warn(f"❌ Session health check failed: {e}")
+                    restart_application()
+                # Egyéb WebDriverException - log de folytatjuk
+                warn(f"⚠️ Session health check warning: {e}")
+            except Exception as e:
+                # Váratlan hiba - log de folytatjuk
+                warn(f"⚠️ Session health check unexpected error: {e}")
+
             bootstrap = in_bootstrap_phase()
 
             # 🧹 POST-BOOTSTRAP CLEANUP – csak egyszer, amikor a bootstrap vége van
@@ -4526,6 +4609,13 @@ if __name__ == "__main__":
 
     except KeyboardInterrupt:
         warn("🛑 Leállítva.")
+    except WebDriverException as e:
+        msg_lower = str(e).lower()
+        if "invalid session" in msg_lower or "chrome not reachable" in msg_lower:
+            warn(f"❌ Critical WebDriver error in main loop: {e}")
+            restart_application()
+        else:
+            warn(f"⚠️ WebDriverException in main loop (not restarting): {e}")
     finally:
         try:
             flush_pending_updates()
