@@ -1856,6 +1856,12 @@ def resolve_pairs_round_robin(pairs) -> tuple[list[tuple[str | None, str | None]
     # targetId → {pair_index, pos(1/2)}
     tracking: dict[str, dict] = {}
     num_pairs_to_open = 0
+    
+    # Track handles before opening targets (for cleanup if CDP fails)
+    try:
+        handles_before = set(driver.window_handles) if driver else set()
+    except Exception:
+        handles_before = set()
 
     # 1) Targetek létrehozása (CDP-safe)
     for idx, p in enumerate(norm):
@@ -1970,20 +1976,42 @@ def resolve_pairs_round_robin(pairs) -> tuple[list[tuple[str | None, str | None]
         time.sleep(CDP_POLL_INTERVAL)
 
     # 3) Timeout után: minden maradék target bezárása (safe CDP + fallback)
+    failed_cdp_closes = []
     for tid in list(tracking.keys()):
         result = _safe_cdp_cmd("Target.closeTarget", {"targetId": tid}, label="RR closeTarget (timeout)")
         tracking.pop(tid, None)
         
-        # Fallback: ha CDP nem működött, próbáljunk Selenium-level cleanup-ot
+        # Ha CDP nem működött, jegyezzük fel
         if result is None:
-            try:
-                current_handles = set(driver.window_handles) if driver else set()
-                # Ha vannak új handleök amiket nem ismerünk, esetleg ezek a timeout-os targetekhez tartoznak
-                # Sajnos targetId → window handle mapping nincs, így csak log-olunk
-                if current_handles:
-                    warn(f"[RR] CDP closeTarget sikertelen tid={tid}, {len(current_handles)} ablak nyitva")
-            except Exception:
-                pass
+            failed_cdp_closes.append(tid)
+    
+    # Fallback: ha voltak sikertelen CDP bezárások, próbáljunk Selenium-level cleanup-ot
+    if failed_cdp_closes:
+        try:
+            current_handles = set(driver.window_handles) if driver else set()
+            # Új ablakok amik a target nyitások során keletkeztek
+            extra_handles = current_handles - handles_before
+            
+            if extra_handles:
+                warn(f"[RR] {len(failed_cdp_closes)} CDP closeTarget sikertelen, {len(extra_handles)} extra ablak – Selenium fallback bezárás")
+                original_handle = driver.current_window_handle if driver.current_window_handle in current_handles else None
+                
+                for handle in extra_handles:
+                    try:
+                        driver.switch_to.window(handle)
+                        driver.close()
+                        warn(f"[RR] ✓ Fallback close sikeres: {handle}")
+                    except Exception as close_err:
+                        warn(f"[RR] ⚠️ Fallback close hiba: {handle} - {close_err}")
+                
+                # Visszaváltunk az eredeti ablakra, ha létezik
+                if original_handle and original_handle in driver.window_handles:
+                    try:
+                        driver.switch_to.window(original_handle)
+                    except Exception:
+                        pass
+        except Exception as fallback_err:
+            warn(f"[RR] Fallback cleanup hiba: {fallback_err}")
 
     total = time.time() - t0
     num_successful = sum(1 for done in done_pairs if done)
@@ -2288,6 +2316,17 @@ def background_nav_worker():
                         _clear_nav_backoff(tbody_id)
                     else:
                         # minden nem 'ok' (beleértve a timeout-ot) → NAV backoff
+                        # Részletes log hogy miért bukott el a valid_external
+                        f1_valid = valid_external(f1)
+                        f2_valid = valid_external(f2)
+                        
+                        # Detect about:blank or surebet.com URLs
+                        f1_issue = "None" if f1 is None else ("about:blank" if f1 == "about:blank" else ("surebet.com" if is_surebet_url(f1) else "invalid"))
+                        f2_issue = "None" if f2 is None else ("about:blank" if f2 == "about:blank" else ("surebet.com" if is_surebet_url(f2) else "invalid"))
+                        
+                        if not f1_valid or not f2_valid:
+                            warn(f"❌ valid_external failed for {tbody_id}: f1={f1_issue} (url={f1}), f2={f2_issue} (url={f2})")
+                        
                         if 'not_found' in (s1, s2):
                             warn(f"🔎 Page not found → NAV backoff: {tbody_id} (s1={s1}, s2={s2})")
                         _schedule_nav_backoff(tbody_id)
