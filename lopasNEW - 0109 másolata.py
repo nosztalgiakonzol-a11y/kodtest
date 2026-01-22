@@ -268,6 +268,149 @@ CLOSING_HANDLES = set()  # Ablak handle-ek, amik épp bezáródnak (race conditi
 # --- CDP COORDINATION ---
 PENDING_CDP_CLOSES = {}  # targetId -> bezárás kezdés időpontja (float)
 
+# --- DIAGNOSTIC LOGGING SYSTEM ---
+class DiagnosticLogger:
+    """
+    Részletes diagnosztikai logolás file-ba minden crash előzményével.
+    Automatikus sorszámozott file-ok: diagnostic-log-1.txt, diagnostic-log-2.txt, stb.
+    """
+    def __init__(self):
+        self.log_file = None
+        self.log_number = self._get_next_log_number()
+        self.operation_buffer = deque(maxlen=100)  # Utolsó 100 művelet memóriában
+        self.cdp_stats = {"opens": 0, "closes": 0, "errors": 0}
+        self.last_health_check = time.time()
+        self.loop_iteration = 0
+        self._init_log_file()
+    
+    def _get_next_log_number(self):
+        """Megkeresi a következő szabad log sorszámot"""
+        n = 1
+        while os.path.exists(f"diagnostic-log-{n}.txt"):
+            n += 1
+        return n
+    
+    def _init_log_file(self):
+        """Új log file létrehozása"""
+        self.log_file = f"diagnostic-log-{self.log_number}.txt"
+        with open(self.log_file, "w", encoding="utf-8") as f:
+            f.write("=" * 80 + "\n")
+            f.write(f"DIAGNOSTIC LOG #{self.log_number}\n")
+            f.write(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Account: {ACTIVE_ACCOUNT_KEY}\n")
+            f.write(f"Python: {sys.version}\n")
+            f.write(f"Platform: {platform.system()} {platform.release()}\n")
+            f.write("=" * 80 + "\n\n")
+        print(f"📋 Diagnostic log: {self.log_file}")
+    
+    def log_event(self, category: str, message: str, level: str = "INFO"):
+        """Esemény logolása file-ba és operation bufferbe"""
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+        entry = f"[{timestamp}] [{level}] [{category}] {message}"
+        
+        # Buffer-be mentés
+        self.operation_buffer.append(entry)
+        
+        # File-ba írás
+        try:
+            with open(self.log_file, "a", encoding="utf-8") as f:
+                f.write(entry + "\n")
+        except Exception:
+            pass  # Ne akadjon el a logolás hibája miatt
+    
+    def log_cdp_lifecycle(self, action: str, target_id: str = None, url: str = None, error: str = None):
+        """CDP target életciklus logolása"""
+        parts = [action]
+        if target_id:
+            parts.append(f"targetId={target_id[:12]}")
+        if url:
+            parts.append(f"url={url[:80]}")
+        if error:
+            parts.append(f"error={error[:100]}")
+            self.cdp_stats["errors"] += 1
+        else:
+            if "open" in action.lower():
+                self.cdp_stats["opens"] += 1
+            elif "close" in action.lower():
+                self.cdp_stats["closes"] += 1
+        
+        self.log_event("CDP", " | ".join(parts), "ERROR" if error else "INFO")
+    
+    def log_session_health(self, window_count: int, active_targets: int = None, memory_mb: int = None):
+        """Session egészségállapot periodic logolása"""
+        now = time.time()
+        if now - self.last_health_check < 30:  # Max 30 másodpercenként
+            return
+        
+        self.last_health_check = now
+        parts = [f"windows={window_count}"]
+        if active_targets is not None:
+            parts.append(f"targets={active_targets}")
+        if memory_mb is not None:
+            parts.append(f"memory={memory_mb}MB")
+        parts.append(f"CDP(open={self.cdp_stats['opens']}, close={self.cdp_stats['closes']}, err={self.cdp_stats['errors']})")
+        
+        self.log_event("HEALTH", " | ".join(parts))
+    
+    def log_loop_timing(self, duration_sec: float):
+        """Main loop iteráció időtartam mérése"""
+        self.loop_iteration += 1
+        
+        if duration_sec > 5.0:
+            self.log_event("TIMING", f"SLOW ITERATION #{self.loop_iteration}: {duration_sec:.2f}s", "WARN")
+        elif self.loop_iteration % 50 == 0:  # Minden 50. iterációnál
+            self.log_event("TIMING", f"Iteration #{self.loop_iteration}: {duration_sec:.3f}s")
+    
+    def log_queue_status(self, open_tasks: int = None, dispatcher_queue: int = None, nav_queue: int = None):
+        """Queue méretek tracking"""
+        parts = []
+        if open_tasks is not None:
+            parts.append(f"OPEN_TASKS={open_tasks}")
+        if dispatcher_queue is not None:
+            parts.append(f"DISPATCHER={dispatcher_queue}")
+        if nav_queue is not None:
+            parts.append(f"NAV={nav_queue}")
+        
+        if parts:
+            self.log_event("QUEUE", " | ".join(parts))
+    
+    def log_race_condition(self, operation: str, handles_state: str = None, pending_cdp: int = None):
+        """Race condition tracking"""
+        parts = [operation]
+        if handles_state:
+            parts.append(f"handles={handles_state}")
+        if pending_cdp is not None:
+            parts.append(f"pending_cdp={pending_cdp}")
+        
+        self.log_event("RACE", " | ".join(parts), "WARN")
+    
+    def log_crash_context(self, exception: Exception, exception_type: str = None):
+        """Crash context + operation buffer dump"""
+        self.log_event("CRASH", "="*60, "ERROR")
+        self.log_event("CRASH", f"Exception: {type(exception).__name__}: {str(exception)[:200]}", "ERROR")
+        if exception_type:
+            self.log_event("CRASH", f"Type: {exception_type}", "ERROR")
+        
+        # Utolsó műveletek dump-ja
+        self.log_event("CRASH", "-"*60, "ERROR")
+        self.log_event("CRASH", f"Last {len(self.operation_buffer)} operations before crash:", "ERROR")
+        for entry in self.operation_buffer:
+            try:
+                with open(self.log_file, "a", encoding="utf-8") as f:
+                    f.write(entry + "\n")
+            except Exception:
+                pass
+        
+        self.log_event("CRASH", "="*60, "ERROR")
+    
+    def log_milestone(self, milestone: str):
+        """Kritikus életciklus események (login, bootstrap, cleanup stb.)"""
+        self.log_event("MILESTONE", milestone, "INFO")
+        print(f"📍 {milestone}")
+
+# Global diagnosztikai logger instance
+DIAG_LOGGER = DiagnosticLogger()
+
 # --- NAV CDP DEBUG (URL figyelés tabváltás nélkül) ---
 DEBUG_NAV_CDP = True          # ha zavar a log, állítsd False-ra
 DEBUG_NAV_CDP_INTERVAL = 2.0  # másodpercenként logoljuk a NAV / külső page targeteket
@@ -656,14 +799,30 @@ def _safe_cdp_cmd(method: str, params: dict | None = None, *, label: str = ""):
 
     try:
         result = driver.execute_cdp_cmd(method, params)
-        # Sikeres bezárás után eltávolítjuk a tracking-ből
-        if method == "Target.closeTarget":
+        
+        # 📋 Diagnostic logging: CDP command sikeres
+        if method == "Target.createTarget":
+            url = params.get("url", "")
+            DIAG_LOGGER.log_cdp_lifecycle("TARGET_CREATE_SUCCESS", url=url)
+        elif method == "Target.closeTarget":
             target_id = params.get("targetId")
             if target_id:
                 PENDING_CDP_CLOSES.pop(target_id, None)
+                DIAG_LOGGER.log_cdp_lifecycle("TARGET_CLOSE_SUCCESS", target_id=target_id)
+        
         return result
     except Exception as e:
         msg = str(e).lower()
+        
+        # 📋 Diagnostic logging: CDP command hiba
+        if method == "Target.createTarget":
+            url = params.get("url", "")
+            DIAG_LOGGER.log_cdp_lifecycle("TARGET_CREATE_ERROR", url=url, error=str(e)[:100])
+        elif method == "Target.closeTarget":
+            target_id = params.get("targetId")
+            if target_id:
+                PENDING_CDP_CLOSES.pop(target_id, None)
+                DIAG_LOGGER.log_cdp_lifecycle("TARGET_CLOSE_ERROR", target_id=target_id, error=str(e)[:100])
 
         # Sikertelen bezárás után is eltávolítjuk (ne maradjon bent)
         if method == "Target.closeTarget":
@@ -2619,6 +2778,10 @@ def close_group_tab(url):
     handle = info.get("handle")
     if handle:
         CLOSING_HANDLES.add(handle)  # Jelzés, hogy bezárás alatt van
+        # 📋 Diagnostic: race condition tracking
+        DIAG_LOGGER.log_race_condition("GROUP_TAB_CLOSING", 
+                                       handles_state=f"closing={len(CLOSING_HANDLES)}", 
+                                       pending_cdp=len(PENDING_CDP_CLOSES))
     try:
         if handle and handle in driver.window_handles:
             driver.switch_to.window(handle)
@@ -3606,9 +3769,11 @@ def login():
         log("✅ Sikeres bejelentkezés.")
         LOGIN_TS = time.time()
         _autoupdate_attempts = 0
+        DIAG_LOGGER.log_milestone(f"LOGIN_SUCCESS (account={ACTIVE_ACCOUNT_KEY})")
 
     except Exception as e:
         print(f"❌ Bejelentkezés sikertelen: {e}")
+        DIAG_LOGGER.log_event("LOGIN", f"Login failed: {str(e)[:100]}", "ERROR")
         try:
             # Fallback: még egyszer megnézzük a login oldalt, de itt is kezeljük az "already signed in"-t
             driver.get(LOGIN_URL)
@@ -4017,6 +4182,7 @@ def post_bootstrap_cleanup():
         return  # már lefutott, ne csináljuk újra
     
     log("🧹 POST-BOOTSTRAP CLEANUP indul: ID-k összehasonlítása active_ids fájllal...")
+    DIAG_LOGGER.log_milestone("POST_BOOTSTRAP_CLEANUP_START")
     
     try:
         # Összegyűjtjük az élő ID-kat a nyitott tabokból
@@ -4057,6 +4223,7 @@ def post_bootstrap_cleanup():
     
     BOOTSTRAP_CLEANUP_DONE = True
     log("🏁 POST-BOOTSTRAP CLEANUP kész – normál működés folytatódik")
+    DIAG_LOGGER.log_milestone(f"POST_BOOTSTRAP_CLEANUP_COMPLETE (stale_removed={len(stale_ids) if stale_ids else 0})")
 
 
 def run_dynamic_bootstrap():
@@ -4068,6 +4235,8 @@ def run_dynamic_bootstrap():
     4. Max 5 perc az egész folyamatra
     """
     global BOOTSTRAP_COMPLETED, MAIN_HANDLE
+    
+    DIAG_LOGGER.log_milestone("BOOTSTRAP_START")
     
     bootstrap_start = time.time()
     MAX_BOOTSTRAP_TIME = 300  # 5 perc
@@ -4196,12 +4365,15 @@ def run_dynamic_bootstrap():
         
         total_time = time.time() - bootstrap_start
         log(f"✅ DINAMIKUS BOOTSTRAP befejezve: {len(opened_next)} NEXT + {len(group_tabs)} GROUP oldal ({total_time:.1f}s)")
+        DIAG_LOGGER.log_milestone(f"BOOTSTRAP_PHASE_COMPLETE (next={len(opened_next)}, group={len(group_tabs)}, time={total_time:.1f}s)")
         
     except Exception as e:
         warn(f"⚠️ DINAMIKUS BOOTSTRAP hiba: {e}")
+        DIAG_LOGGER.log_event("BOOTSTRAP", f"Error: {str(e)[:100]}", "ERROR")
     finally:
         BOOTSTRAP_COMPLETED = True
         log("🏁 BOOTSTRAP_COMPLETED = True – normál működés indul")
+        DIAG_LOGGER.log_milestone("BOOTSTRAP_COMPLETED")
 
 
 def full_resync_and_cleanup(max_groups=None):
@@ -4410,24 +4582,37 @@ if __name__ == "__main__":
 
     try:
         while True:
+            loop_start_time = time.time()
+            
             # 💀 Ha a WebDriver meghalt, ne kínlódjunk tovább – lépjünk ki a fő loopból
             if DRIVER_DEAD:
                 warn("💀 WebDriver kapcsolat meghalt (DRIVER_DEAD=True) – kilépek a fő ciklusból.")
+                DIAG_LOGGER.log_crash_context(Exception("DRIVER_DEAD"), "DRIVER_DEATH")
                 break
 
             # 🏥 Session health check: gyors window_handles check
             try:
-                _ = driver.window_handles
+                handles = driver.window_handles
+                # Diagnostic: periodic health logging
+                try:
+                    info = _safe_cdp_cmd("Target.getTargets", {}, label="health_check")
+                    target_count = len(info.get("targetInfos", [])) if info else 0
+                except Exception:
+                    target_count = None
+                DIAG_LOGGER.log_session_health(len(handles), target_count)
             except WebDriverException as e:
                 msg_lower = str(e).lower()
                 if "invalid session" in msg_lower or "chrome not reachable" in msg_lower:
                     warn(f"❌ Session health check failed: {e}")
+                    DIAG_LOGGER.log_crash_context(e, "SESSION_LOSS")
                     restart_application()
                 # Egyéb WebDriverException - log de folytatjuk
                 warn(f"⚠️ Session health check warning: {e}")
+                DIAG_LOGGER.log_event("HEALTH", f"Warning: {str(e)[:100]}", "WARN")
             except Exception as e:
                 # Váratlan hiba - log de folytatjuk
                 warn(f"⚠️ Session health check unexpected error: {e}")
+                DIAG_LOGGER.log_event("HEALTH", f"Unexpected: {str(e)[:100]}", "ERROR")
 
             bootstrap = in_bootstrap_phase()
 
@@ -4605,17 +4790,33 @@ if __name__ == "__main__":
                 nav_started = True
 
             prev_ids_main = curr_ids_main
+            
+            # 📊 Loop timing diagnostic
+            loop_duration = time.time() - loop_start_time
+            DIAG_LOGGER.log_loop_timing(loop_duration)
+            
+            # 📈 Queue status periodic logging
+            if DIAG_LOGGER.loop_iteration % 20 == 0:  # Minden 20. iterációnál
+                try:
+                    open_tasks_len = len(OPEN_TASKS) if OPEN_TASKS else 0
+                    DIAG_LOGGER.log_queue_status(open_tasks=open_tasks_len)
+                except Exception:
+                    pass
+            
             time.sleep(CHECK_INTERVAL)
 
     except KeyboardInterrupt:
         warn("🛑 Leállítva.")
+        DIAG_LOGGER.log_milestone("Application stopped by user (KeyboardInterrupt)")
     except WebDriverException as e:
         msg_lower = str(e).lower()
         if "invalid session" in msg_lower or "chrome not reachable" in msg_lower:
             warn(f"❌ Critical WebDriver error in main loop: {e}")
+            DIAG_LOGGER.log_crash_context(e, "WEBDRIVER_CRASH")
             restart_application()
         else:
             warn(f"⚠️ WebDriverException in main loop (not restarting): {e}")
+            DIAG_LOGGER.log_event("ERROR", f"WebDriverException (not critical): {str(e)[:150]}", "WARN")
     finally:
         try:
             flush_pending_updates()
