@@ -2144,6 +2144,9 @@ def resolve_pairs_round_robin(pairs) -> tuple[list[tuple[str | None, str | None]
     open_elapsed = time.time() - t0
     deadline = time.time() + (PAIR_TIMEOUT_SEC or 0.0)
     last_dbg = 0.0
+    
+    # Track readyState for early surebet.com detection per target
+    ready_state_cache: dict[str, str] = {}  # targetId -> readyState
 
     # 2) Polling CDP-vel (biztonságosan)
     while tracking and time.time() < deadline:
@@ -2169,6 +2172,26 @@ def resolve_pairs_round_robin(pairs) -> tuple[list[tuple[str | None, str | None]
 
             # csak akkor tekintjük késznek, ha már elhagyta a surebet.com-ot
             if not valid_external(url):
+                # Early detection: ha complete ÉS surebet.com-on van még
+                # Check document.readyState via CDP
+                if is_surebet_url(url):
+                    try:
+                        result = _safe_cdp_cmd(
+                            "Runtime.evaluate",
+                            {
+                                "expression": "document.readyState",
+                                "returnByValue": True,
+                                "contextId": None  # Let CDP figure out the right context
+                            },
+                            label=f"RR readyState check tid={tid[:8]}"
+                        )
+                        if result and isinstance(result, dict):
+                            ready_state = result.get("result", {}).get("value", "")
+                            ready_state_cache[tid] = ready_state
+                        else:
+                            ready_state_cache[tid] = ""
+                    except Exception:
+                        ready_state_cache[tid] = ""
                 continue
 
             entry = tracking.get(tid)
@@ -2205,6 +2228,42 @@ def resolve_pairs_round_robin(pairs) -> tuple[list[tuple[str | None, str | None]
 
                 if LOG_PAIR_DONE:
                     log(f"[RR] ✓ Pár kész (idx={pair_idx}) f1={f1} f2={f2}")
+        
+        # Early timeout detection: ha mindkét pár complete ÉS mindkettő még surebet.com-on van
+        pairs_to_early_timeout = []
+        for pair_idx in range(num_pairs):
+            if done_pairs[pair_idx]:
+                continue
+            
+            # Find both targets for this pair
+            pair_targets = [(tid, info) for tid, info in tracking.items() if info["pair"] == pair_idx]
+            if len(pair_targets) != 2:
+                continue  # Ha nincs meg mindkét target, skip
+            
+            tid1, info1 = pair_targets[0]
+            tid2, info2 = pair_targets[1]
+            
+            # Check if both are complete AND on surebet.com
+            state1 = ready_state_cache.get(tid1, "")
+            state2 = ready_state_cache.get(tid2, "")
+            
+            if state1 == "complete" and state2 == "complete":
+                # Both pages loaded and both still on surebet.com
+                pairs_to_early_timeout.append((pair_idx, tid1, tid2))
+        
+        # Close pairs that are stuck on surebet.com
+        for pair_idx, tid1, tid2 in pairs_to_early_timeout:
+            states_by_pair[pair_idx] = ("timeout", "timeout")
+            done_pairs[pair_idx] = True
+            
+            _safe_cdp_cmd("Target.closeTarget", {"targetId": tid1}, label="RR closeTarget (early timeout - surebet.com)")
+            _safe_cdp_cmd("Target.closeTarget", {"targetId": tid2}, label="RR closeTarget (early timeout - surebet.com)")
+            tracking.pop(tid1, None)
+            tracking.pop(tid2, None)
+            ready_state_cache.pop(tid1, None)
+            ready_state_cache.pop(tid2, None)
+            
+            warn(f"[RR] ⚠️ Early timeout (idx={pair_idx}): mindkét oldal complete de surebet.com-on maradt")
 
         # debug log 2 mp-enként (ha engedélyezve)
         if NAV_DEBUG_INTERVAL > 0 and (time.time() - last_dbg) >= NAV_DEBUG_INTERVAL:
