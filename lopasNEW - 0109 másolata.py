@@ -2102,6 +2102,7 @@ def resolve_pairs_round_robin(pairs) -> tuple[list[tuple[str | None, str | None]
         handles_before = set()
 
     # 1) Targetek létrehozása (CDP-safe)
+    creation_time = time.time()
     for idx, p in enumerate(norm):
         if p is None:
             continue
@@ -2116,7 +2117,7 @@ def resolve_pairs_round_robin(pairs) -> tuple[list[tuple[str | None, str | None]
         )
         tid1 = res1.get("targetId") if isinstance(res1, dict) else None
         if tid1:
-            tracking[tid1] = {"pair": idx, "pos": 1}
+            tracking[tid1] = {"pair": idx, "pos": 1, "start_time": creation_time}
             created_any = True
         else:
             warn(f"[RR] Target.createTarget sikertelen (href1) idx={idx}")
@@ -2129,7 +2130,7 @@ def resolve_pairs_round_robin(pairs) -> tuple[list[tuple[str | None, str | None]
         )
         tid2 = res2.get("targetId") if isinstance(res2, dict) else None
         if tid2:
-            tracking[tid2] = {"pair": idx, "pos": 2}
+            tracking[tid2] = {"pair": idx, "pos": 2, "start_time": creation_time}
             created_any = True
         else:
             warn(f"[RR] Target.createTarget sikertelen (href2) idx={idx}")
@@ -2172,26 +2173,18 @@ def resolve_pairs_round_robin(pairs) -> tuple[list[tuple[str | None, str | None]
 
             # csak akkor tekintjük késznek, ha már elhagyta a surebet.com-ot
             if not valid_external(url):
-                # Early detection: ha complete ÉS surebet.com-on van még
-                # Check document.readyState via CDP
+                # Early detection: ha surebet.com-on van még egy ideig
+                # Ellenőrizzük hogy mennyi ideje nyitott már
                 if is_surebet_url(url):
-                    try:
-                        result = _safe_cdp_cmd(
-                            "Runtime.evaluate",
-                            {
-                                "expression": "document.readyState",
-                                "returnByValue": True,
-                                "contextId": None  # Let CDP figure out the right context
-                            },
-                            label=f"RR readyState check tid={tid[:8]}"
-                        )
-                        if result and isinstance(result, dict):
-                            ready_state = result.get("result", {}).get("value", "")
-                            ready_state_cache[tid] = ready_state
+                    entry = tracking.get(tid)
+                    if entry:
+                        time_open = now - entry.get("start_time", now)
+                        # Ha már 3+ másodperce nyitott és még mindig surebet.com-on van
+                        # → valószínűleg nem fog sikerülni a navigáció
+                        if time_open >= 3.0:
+                            ready_state_cache[tid] = "complete"
                         else:
                             ready_state_cache[tid] = ""
-                    except Exception:
-                        ready_state_cache[tid] = ""
                 continue
 
             entry = tracking.get(tid)
