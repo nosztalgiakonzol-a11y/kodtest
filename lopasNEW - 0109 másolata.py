@@ -2177,6 +2177,7 @@ def resolve_pairs_round_robin(pairs) -> tuple[list[tuple[str | None, str | None]
                 if is_surebet_url(url):
                     entry = tracking.get(tid)
                     if entry:
+                        now = time.time()
                         time_open = now - entry.get("start_time", now)
                         
                         # 1. Próbáljuk CDP-vel kiolvasni a "Page not found" szöveget
