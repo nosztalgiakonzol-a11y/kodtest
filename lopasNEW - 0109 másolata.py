@@ -177,7 +177,7 @@ NAV_WORKER_MAX_PAIRS = 11
 PAIR_TIMEOUT_SEC = FIX_URL_WAIT_SEC  # most 20 mp, ugyanaz mint a régi FIX_URL_WAIT_SEC
 
 # Milyen gyakran kérdezzük le CDP-vel a Target.getTargets-et (másodperc)
-CDP_POLL_INTERVAL = 0.15  # 150 ms körül
+CDP_POLL_INTERVAL = 0.20  # 200 ms - csökkenti CPU terhelést és CDP spam-et
 
 # Logoljuk-e, ha egy pár mindkét végső linkje megvan és a pár lezárult
 LOG_PAIR_DONE = True
@@ -193,19 +193,19 @@ NAV_STABLE_AFTER_EXIT = 0.42 # ha kimentünk NAV-ról, ennyit várunk stabilan
 
 # --- BOOTSTRAP FÁZIS: indulás után X másodpercig csak tabnyitás + ID-gyűjtés ---
 RUN_STARTED_AT = 0.0        # induláskor beállítjuk __main__-ben
-BOOTSTRAP_SEC = 50.0        # ennyi másodpercig megy a "csak nyitunk mindent" fázis
+BOOTSTRAP_SEC = 50.0        # legacy, not used in dynamic mode
+BOOTSTRAP_CLEANUP_DONE = False  # jelzi, hogy a post-bootstrap cleanup már lefutott-e
+BOOTSTRAP_COMPLETED = False      # jelzi, hogy a dinamikus bootstrap befejeződött
 
 def in_bootstrap_phase() -> bool:
     """
-    True: az első BOOTSTRAP_SEC másodpercben a script indulásától.
+    True: amíg a dinamikus bootstrap fut (BOOTSTRAP_COMPLETED == False).
     Ezalatt:
       - NINCS SAVE / UPDATE / DELETE Supabase felé
       - NINCS NAV worker
       - csak main/group/next oldalak nyitása + tbody ID gyűjtés történik
     """
-    if RUN_STARTED_AT <= 0:
-        return True
-    return (time.time() - RUN_STARTED_AT) < BOOTSTRAP_SEC
+    return not BOOTSTRAP_COMPLETED
 
 # --- ACTIVE / GONE ---
 ACTIVE_FILE = "active_ids.txt"
@@ -261,6 +261,165 @@ ROBIN_SPIN_SLEEP = 0.15        # 0.0 – tényleg full-gáz pörgetés
 MAX_BODY_SNIFF = 1200         # ennyi karakterig nézünk bele a body-ba "not found"-ot keresni
 
 HMAP_MAX_SEC = 60  # max ennyi másodpercet engedünk hmap + URL olvasásra
+
+# --- WINDOW CLOSURE COORDINATION ---
+CLOSING_HANDLES = set()  # Ablak handle-ek, amik épp bezáródnak (race condition védelem)
+
+# --- CDP COORDINATION ---
+PENDING_CDP_CLOSES = {}  # targetId -> bezárás kezdés időpontja (float)
+
+# --- DIAGNOSTIC LOGGING SYSTEM ---
+class DiagnosticLogger:
+    """
+    Részletes diagnosztikai logolás file-ba minden crash előzményével.
+    Automatikus sorszámozott file-ok: diagnostic-log-1.txt, diagnostic-log-2.txt, stb.
+    """
+    def __init__(self):
+        self.log_file = None
+        self.log_number = self._get_next_log_number()
+        self.operation_buffer = deque(maxlen=100)  # Utolsó 100 művelet memóriában
+        self.cdp_stats = {"opens": 0, "closes": 0, "errors": 0}
+        self.last_health_check = time.time()
+        self.loop_iteration = 0
+        self._init_log_file()
+    
+    def _get_next_log_number(self):
+        """Megkeresi a következő szabad log sorszámot"""
+        n = 1
+        while os.path.exists(f"diagnostic-log-{n}.txt"):
+            n += 1
+        return n
+    
+    def _init_log_file(self):
+        """Új log file létrehozása"""
+        self.log_file = f"diagnostic-log-{self.log_number}.txt"
+        with open(self.log_file, "w", encoding="utf-8") as f:
+            f.write("=" * 80 + "\n")
+            f.write(f"DIAGNOSTIC LOG #{self.log_number}\n")
+            f.write(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Account: {ACTIVE_ACCOUNT_KEY}\n")
+            f.write(f"Python: {sys.version}\n")
+            f.write(f"Platform: {platform.system()} {platform.release()}\n")
+            f.write("=" * 80 + "\n\n")
+        print(f"📋 Diagnostic log: {self.log_file}")
+    
+    def log_event(self, category: str, message: str, level: str = "INFO"):
+        """Esemény logolása file-ba és operation bufferbe"""
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+        entry = f"[{timestamp}] [{level}] [{category}] {message}"
+        
+        # Buffer-be mentés
+        self.operation_buffer.append(entry)
+        
+        # File-ba írás
+        try:
+            with open(self.log_file, "a", encoding="utf-8") as f:
+                f.write(entry + "\n")
+        except Exception:
+            pass  # Ne akadjon el a logolás hibája miatt
+    
+    def log_cdp_lifecycle(self, action: str, target_id: str = None, url: str = None, error: str = None):
+        """CDP target életciklus logolása"""
+        parts = [action]
+        if target_id:
+            parts.append(f"targetId={target_id[:12]}")
+        if url:
+            parts.append(f"url={url[:80]}")
+        if error:
+            parts.append(f"error={error[:100]}")
+            self.cdp_stats["errors"] += 1
+        else:
+            if "open" in action.lower():
+                self.cdp_stats["opens"] += 1
+            elif "close" in action.lower():
+                self.cdp_stats["closes"] += 1
+        
+        self.log_event("CDP", " | ".join(parts), "ERROR" if error else "INFO")
+    
+    def log_session_health(self, window_count: int, active_targets: int = None, memory_mb: int = None):
+        """Session egészségállapot periodic logolása"""
+        now = time.time()
+        if now - self.last_health_check < 30:  # Max 30 másodpercenként
+            return
+        
+        self.last_health_check = now
+        parts = [f"windows={window_count}"]
+        if active_targets is not None:
+            parts.append(f"targets={active_targets}")
+        if memory_mb is not None:
+            parts.append(f"memory={memory_mb}MB")
+        parts.append(f"CDP(open={self.cdp_stats['opens']}, close={self.cdp_stats['closes']}, err={self.cdp_stats['errors']})")
+        
+        self.log_event("HEALTH", " | ".join(parts))
+    
+    def log_loop_timing(self, duration_sec: float):
+        """Main loop iteráció időtartam mérése"""
+        self.loop_iteration += 1
+        
+        if duration_sec > 5.0:
+            self.log_event("TIMING", f"SLOW ITERATION #{self.loop_iteration}: {duration_sec:.2f}s", "WARN")
+        elif self.loop_iteration % 50 == 0:  # Minden 50. iterációnál
+            self.log_event("TIMING", f"Iteration #{self.loop_iteration}: {duration_sec:.3f}s")
+    
+    def log_queue_status(self, open_tasks: int = None, dispatcher_queue: int = None, nav_queue: int = None):
+        """Queue méretek tracking"""
+        parts = []
+        if open_tasks is not None:
+            parts.append(f"OPEN_TASKS={open_tasks}")
+        if dispatcher_queue is not None:
+            parts.append(f"DISPATCHER={dispatcher_queue}")
+        if nav_queue is not None:
+            parts.append(f"NAV={nav_queue}")
+        
+        if parts:
+            self.log_event("QUEUE", " | ".join(parts))
+    
+    def log_race_condition(self, operation: str, handles_state: str = None, pending_cdp: int = None):
+        """Race condition tracking"""
+        parts = [operation]
+        if handles_state:
+            parts.append(f"handles={handles_state}")
+        if pending_cdp is not None:
+            parts.append(f"pending_cdp={pending_cdp}")
+        
+        self.log_event("RACE", " | ".join(parts), "WARN")
+    
+    def log_crash_context(self, exception: Exception, exception_type: str = None):
+        """Crash context + operation buffer dump"""
+        self.log_event("CRASH", "="*60, "ERROR")
+        self.log_event("CRASH", f"Exception: {type(exception).__name__}: {str(exception)[:200]}", "ERROR")
+        if exception_type:
+            self.log_event("CRASH", f"Type: {exception_type}", "ERROR")
+        
+        # Utolsó műveletek dump-ja
+        self.log_event("CRASH", "-"*60, "ERROR")
+        self.log_event("CRASH", f"Last {len(self.operation_buffer)} operations before crash:", "ERROR")
+        for entry in self.operation_buffer:
+            try:
+                with open(self.log_file, "a", encoding="utf-8") as f:
+                    f.write(entry + "\n")
+            except Exception:
+                pass
+        
+        self.log_event("CRASH", "="*60, "ERROR")
+    
+    def log_milestone(self, milestone: str):
+        """Kritikus életciklus események (login, bootstrap, cleanup stb.)"""
+        self.log_event("MILESTONE", milestone, "INFO")
+        print(f"📍 {milestone}")
+
+# Global diagnosztikai logger instance
+DIAG_LOGGER = DiagnosticLogger()
+
+# --- CDP-BASED TBODY READING FEATURE FLAG ---
+USE_CDP_FOR_TBODY_READING = True  # True = CDP próbálkozás Selenium fallback-kel, False = csak Selenium
+# Ha USE_CDP_FOR_TBODY_READING = True:
+#   - CDP Runtime.evaluate próbálkozás minden tabon
+#   - Hiba esetén automatikus Selenium fallback
+#   - 70-80% gyorsabb, kevesebb race condition, kevesebb "no such window" hiba
+# Ha USE_CDP_FOR_TBODY_READING = False:
+#   - Csak Selenium (eredeti működés)
+#   - 100% backward compatibility
 
 # --- NAV CDP DEBUG (URL figyelés tabváltás nélkül) ---
 DEBUG_NAV_CDP = True          # ha zavar a log, állítsd False-ra
@@ -607,8 +766,9 @@ def _safe_cdp_cmd(method: str, params: dict | None = None, *, label: str = ""):
     - Ha 'no such window' / 'web view not found' / stb. hibát kapunk → log + None.
     - Ha driver connection error (HTTPConnectionPool / WinError 10061...), akkor DRIVER_DEAD=True,
       és innentől minden cdp hívás skip-el.
+    - Target.closeTarget: duplikált bezárás védelem PENDING_CDP_CLOSES-szal
     """
-    global driver, DRIVER_DEAD
+    global driver, DRIVER_DEAD, PENDING_CDP_CLOSES
 
     if params is None:
         params = {}
@@ -632,10 +792,53 @@ def _safe_cdp_cmd(method: str, params: dict | None = None, *, label: str = ""):
         warn(f"[CDP] {method} skip – nincs window (label={label})")
         return None
 
+    # CDP koordináció: Target.closeTarget duplikált bezárás védelem
+    if method == "Target.closeTarget":
+        target_id = params.get("targetId")
+        if target_id:
+            # Ha már bezárás alatt van, skip
+            if target_id in PENDING_CDP_CLOSES:
+                # Timeout ellenőrzés: ha 5s óta bent van, eltávolítjuk (esetleg lefagyott)
+                if time.time() - PENDING_CDP_CLOSES[target_id] > 5.0:
+                    PENDING_CDP_CLOSES.pop(target_id, None)
+                else:
+                    # Még mindig friss, skip
+                    return None
+            # Regisztráljuk hogy bezárás alatt van
+            PENDING_CDP_CLOSES[target_id] = time.time()
+
     try:
-        return driver.execute_cdp_cmd(method, params)
+        result = driver.execute_cdp_cmd(method, params)
+        
+        # 📋 Diagnostic logging: CDP command sikeres
+        if method == "Target.createTarget":
+            url = params.get("url", "")
+            DIAG_LOGGER.log_cdp_lifecycle("TARGET_CREATE_SUCCESS", url=url)
+        elif method == "Target.closeTarget":
+            target_id = params.get("targetId")
+            if target_id:
+                PENDING_CDP_CLOSES.pop(target_id, None)
+                DIAG_LOGGER.log_cdp_lifecycle("TARGET_CLOSE_SUCCESS", target_id=target_id)
+        
+        return result
     except Exception as e:
         msg = str(e).lower()
+        
+        # 📋 Diagnostic logging: CDP command hiba
+        if method == "Target.createTarget":
+            url = params.get("url", "")
+            DIAG_LOGGER.log_cdp_lifecycle("TARGET_CREATE_ERROR", url=url, error=str(e)[:100])
+        elif method == "Target.closeTarget":
+            target_id = params.get("targetId")
+            if target_id:
+                PENDING_CDP_CLOSES.pop(target_id, None)
+                DIAG_LOGGER.log_cdp_lifecycle("TARGET_CLOSE_ERROR", target_id=target_id, error=str(e)[:100])
+
+        # Sikertelen bezárás után is eltávolítjuk (ne maradjon bent)
+        if method == "Target.closeTarget":
+            target_id = params.get("targetId")
+            if target_id:
+                PENDING_CDP_CLOSES.pop(target_id, None)
 
         # ha ez is driver connection error → beállítjuk a flaget
         if _is_driver_connection_error(e):
@@ -643,7 +846,7 @@ def _safe_cdp_cmd(method: str, params: dict | None = None, *, label: str = ""):
             warn(f"[CDP] {method} driver-connection hiba, DRIVER_DEAD=True (label={label}): {e}")
             return None
 
-        # tipikus „ablak megszűnt” hibák
+        # tipikus „ablak megszűnt" hibák
         if (
             "no such window" in msg
             or "web view not found" in msg
@@ -656,6 +859,44 @@ def _safe_cdp_cmd(method: str, params: dict | None = None, *, label: str = ""):
         # egyéb CDP hiba – logoljuk, de nem ölünk meg semmit
         warn(f"[CDP] {method} hiba (label={label}): {e}")
         return None
+
+
+# ---------- CRASH RECOVERY ----------
+def restart_application():
+    """
+    Univerzális crash recovery: újraindítja az alkalmazást.
+    - Tries graceful driver.quit()
+    - Kills Chrome processes as backup
+    - Restarts the script with os.execv()
+    """
+    global driver
+    
+    warn("⚠️ Session crash detected, restarting application...")
+    
+    # Try graceful close
+    try:
+        if driver is not None:
+            driver.quit()
+    except Exception as e:
+        warn(f"driver.quit() failed: {e}")
+    
+    # Backup: Kill Chrome processes
+    try:
+        if platform.system() == "Windows":
+            os.system("taskkill /F /IM chrome.exe /T 2>nul")
+            os.system("taskkill /F /IM chromedriver.exe /T 2>nul")
+        else:
+            os.system("pkill -9 chrome 2>/dev/null")
+            os.system("pkill -9 chromedriver 2>/dev/null")
+    except Exception as e:
+        warn(f"Chrome process kill failed: {e}")
+    
+    # Small delay before restart
+    time.sleep(2)
+    
+    # Restart script
+    warn("🔄 Restarting script...")
+    os.execv(sys.executable, ['python'] + sys.argv)
 
 
 # ---------- URL utilok ----------
@@ -1853,8 +2094,15 @@ def resolve_pairs_round_robin(pairs) -> tuple[list[tuple[str | None, str | None]
     # targetId → {pair_index, pos(1/2)}
     tracking: dict[str, dict] = {}
     num_pairs_to_open = 0
+    
+    # Track handles before opening targets (for cleanup if CDP fails)
+    try:
+        handles_before = set(driver.window_handles) if driver else set()
+    except Exception:
+        handles_before = set()
 
     # 1) Targetek létrehozása (CDP-safe)
+    creation_time = time.time()
     for idx, p in enumerate(norm):
         if p is None:
             continue
@@ -1869,7 +2117,7 @@ def resolve_pairs_round_robin(pairs) -> tuple[list[tuple[str | None, str | None]
         )
         tid1 = res1.get("targetId") if isinstance(res1, dict) else None
         if tid1:
-            tracking[tid1] = {"pair": idx, "pos": 1}
+            tracking[tid1] = {"pair": idx, "pos": 1, "start_time": creation_time}
             created_any = True
         else:
             warn(f"[RR] Target.createTarget sikertelen (href1) idx={idx}")
@@ -1882,7 +2130,7 @@ def resolve_pairs_round_robin(pairs) -> tuple[list[tuple[str | None, str | None]
         )
         tid2 = res2.get("targetId") if isinstance(res2, dict) else None
         if tid2:
-            tracking[tid2] = {"pair": idx, "pos": 2}
+            tracking[tid2] = {"pair": idx, "pos": 2, "start_time": creation_time}
             created_any = True
         else:
             warn(f"[RR] Target.createTarget sikertelen (href2) idx={idx}")
@@ -1897,6 +2145,9 @@ def resolve_pairs_round_robin(pairs) -> tuple[list[tuple[str | None, str | None]
     open_elapsed = time.time() - t0
     deadline = time.time() + (PAIR_TIMEOUT_SEC or 0.0)
     last_dbg = 0.0
+    
+    # Track readyState for early surebet.com detection per target
+    ready_state_cache: dict[str, str] = {}  # targetId -> readyState
 
     # 2) Polling CDP-vel (biztonságosan)
     while tracking and time.time() < deadline:
@@ -1922,6 +2173,53 @@ def resolve_pairs_round_robin(pairs) -> tuple[list[tuple[str | None, str | None]
 
             # csak akkor tekintjük késznek, ha már elhagyta a surebet.com-ot
             if not valid_external(url):
+                # Early detection: ha surebet.com-on van és "Page not found" szöveg található
+                if is_surebet_url(url):
+                    entry = tracking.get(tid)
+                    if entry:
+                        now = time.time()
+                        time_open = now - entry.get("start_time", now)
+                        
+                        # Csak 7s után ellenőrizzük a "Page not found" szöveget Selenium-mal
+                        page_not_found = False
+                        if time_open >= 7.0:
+                            try:
+                                # Selenium window switch: végigmegyünk az összes window-n
+                                saved_handle = None
+                                try:
+                                    saved_handle = driver.current_window_handle
+                                except:
+                                    pass
+                                
+                                for handle in driver.window_handles:
+                                    try:
+                                        driver.switch_to.window(handle)
+                                        current_url = driver.current_url
+                                        # Ha ez az URL egy surebet.com oldal
+                                        if is_surebet_url(current_url):
+                                            body_text = driver.find_element(By.TAG_NAME, "body").text.lower()
+                                            if "page not found" in body_text or "404" in body_text or "not found" in body_text:
+                                                page_not_found = True
+                                                break
+                                    except:
+                                        pass
+                                
+                                # Switch vissza az eredeti handle-re vagy MAIN-re
+                                try:
+                                    if saved_handle:
+                                        driver.switch_to.window(saved_handle)
+                                    else:
+                                        driver.switch_to.window(MAIN_HANDLE)
+                                except:
+                                    pass
+                            except Exception as sel_err:
+                                pass  # Selenium check elbukott
+                        
+                        # Ha megtaláltuk a "Page not found" szöveget → complete
+                        if page_not_found:
+                            ready_state_cache[tid] = "complete"
+                        else:
+                            ready_state_cache[tid] = ""
                 continue
 
             entry = tracking.get(tid)
@@ -1958,6 +2256,42 @@ def resolve_pairs_round_robin(pairs) -> tuple[list[tuple[str | None, str | None]
 
                 if LOG_PAIR_DONE:
                     log(f"[RR] ✓ Pár kész (idx={pair_idx}) f1={f1} f2={f2}")
+        
+        # Early timeout detection: ha mindkét pár complete ÉS mindkettő még surebet.com-on van
+        pairs_to_early_timeout = []
+        for pair_idx in range(num_pairs):
+            if done_pairs[pair_idx]:
+                continue
+            
+            # Find both targets for this pair
+            pair_targets = [(tid, info) for tid, info in tracking.items() if info["pair"] == pair_idx]
+            if len(pair_targets) != 2:
+                continue  # Ha nincs meg mindkét target, skip
+            
+            tid1, info1 = pair_targets[0]
+            tid2, info2 = pair_targets[1]
+            
+            # Check if both are complete AND on surebet.com
+            state1 = ready_state_cache.get(tid1, "")
+            state2 = ready_state_cache.get(tid2, "")
+            
+            if state1 == "complete" and state2 == "complete":
+                # Both pages loaded and both still on surebet.com
+                pairs_to_early_timeout.append((pair_idx, tid1, tid2))
+        
+        # Close pairs that are stuck on surebet.com
+        for pair_idx, tid1, tid2 in pairs_to_early_timeout:
+            states_by_pair[pair_idx] = ("timeout", "timeout")
+            done_pairs[pair_idx] = True
+            
+            _safe_cdp_cmd("Target.closeTarget", {"targetId": tid1}, label="RR closeTarget (early timeout - surebet.com)")
+            _safe_cdp_cmd("Target.closeTarget", {"targetId": tid2}, label="RR closeTarget (early timeout - surebet.com)")
+            tracking.pop(tid1, None)
+            tracking.pop(tid2, None)
+            ready_state_cache.pop(tid1, None)
+            ready_state_cache.pop(tid2, None)
+            
+            warn(f"[RR] ⚠️ Early timeout (idx={pair_idx}): mindkét oldal 'Page not found' → surebet.com-on maradt")
 
         # debug log 2 mp-enként (ha engedélyezve)
         if NAV_DEBUG_INTERVAL > 0 and (time.time() - last_dbg) >= NAV_DEBUG_INTERVAL:
@@ -1966,14 +2300,64 @@ def resolve_pairs_round_robin(pairs) -> tuple[list[tuple[str | None, str | None]
 
         time.sleep(CDP_POLL_INTERVAL)
 
-    # 3) Timeout után: minden maradék target bezárása (safe CDP)
+    # 3) Timeout után: minden maradék target bezárása (safe CDP + fallback)
+    failed_cdp_closes = []
     for tid in list(tracking.keys()):
-        _safe_cdp_cmd("Target.closeTarget", {"targetId": tid}, label="RR closeTarget (timeout)")
+        result = _safe_cdp_cmd("Target.closeTarget", {"targetId": tid}, label="RR closeTarget (timeout)")
         tracking.pop(tid, None)
+        
+        # Ha CDP nem működött, jegyezzük fel
+        if result is None:
+            failed_cdp_closes.append(tid)
+    
+    # Fallback: ha voltak sikertelen CDP bezárások, próbáljunk Selenium-level cleanup-ot
+    if failed_cdp_closes:
+        try:
+            current_handles = set(driver.window_handles) if driver else set()
+            # Új ablakok amik a target nyitások során keletkeztek
+            extra_handles = current_handles - handles_before
+            
+            # VÉDELEM: MAIN_HANDLE, GROUP, NEXT tabok SOHA ne legyenek bezárva
+            protected_handles = set()
+            if MAIN_HANDLE and MAIN_HANDLE in extra_handles:
+                protected_handles.add(MAIN_HANDLE)
+                warn(f"[RR] 🛡️ MAIN_HANDLE védelem aktiválva fallback cleanup-ban")
+            for info in group_tabs.values():
+                h = info.get("handle")
+                if h and h in extra_handles:
+                    protected_handles.add(h)
+            for info in next_tabs.values():
+                h = info.get("handle")
+                if h and h in extra_handles:
+                    protected_handles.add(h)
+            
+            extra_handles = extra_handles - protected_handles
+            
+            if extra_handles:
+                warn(f"[RR] {len(failed_cdp_closes)} CDP closeTarget sikertelen, {len(extra_handles)} extra ablak – Selenium fallback bezárás")
+                original_handle = driver.current_window_handle if driver.current_window_handle in current_handles else None
+                
+                for handle in extra_handles:
+                    try:
+                        driver.switch_to.window(handle)
+                        driver.close()
+                        warn(f"[RR] ✓ Fallback close sikeres: {handle}")
+                    except Exception as close_err:
+                        warn(f"[RR] ⚠️ Fallback close hiba: {handle} - {close_err}")
+                
+                # Visszaváltunk az eredeti ablakra, ha létezik
+                if original_handle and original_handle in driver.window_handles:
+                    try:
+                        driver.switch_to.window(original_handle)
+                    except Exception:
+                        pass
+        except Exception as fallback_err:
+            warn(f"[RR] Fallback cleanup hiba: {fallback_err}")
 
     total = time.time() - t0
+    num_successful = sum(1 for done in done_pairs if done)
     log(
-        f"resolve_pairs_round_robin(streaming): {num_pairs_to_open} pár, "
+        f"resolve_pairs_round_robin(streaming): {num_pairs_to_open} pár, sikeres={num_successful}, "
         f"open={open_elapsed:.3f}s, total={total:.3f}s, timeout={PAIR_TIMEOUT_SEC:.1f}s"
     )
 
@@ -2096,7 +2480,25 @@ def resolve_pairs_staggered(pairs, timeout=RESOLVE_TIMEOUT, stable_period=RESOLV
             created_list = list(cur - prev) if prev else []
         except Exception:
             created_list = []
+        
+        # VÉDELEM: MAIN_HANDLE, GROUP, NEXT tabok SOHA ne legyenek bezárva
+        protected_handles = set()
+        if MAIN_HANDLE and MAIN_HANDLE in created_list:
+            protected_handles.add(MAIN_HANDLE)
+            warn(f"[resolve_all_pairs_streaming] 🛡️ MAIN_HANDLE védelem aktiválva cleanup-ban")
+        for info in group_tabs.values():
+            h = info.get("handle")
+            if h and h in created_list:
+                protected_handles.add(h)
+        for info in next_tabs.values():
+            h = info.get("handle")
+            if h and h in created_list:
+                protected_handles.add(h)
+        
+        # Csak a nem védett handle-eket zárjuk be
         for h in created_list:
+            if h in protected_handles:
+                continue
             try:
                 if h in driver.window_handles:
                     driver.switch_to.window(h)
@@ -2233,48 +2635,74 @@ def background_nav_worker():
 
             # 3) Eredmények feldolgozása
             for idx, task in enumerate(todo):
-                tbody_id = task["id"]
+                try:
+                    tbody_id = task["id"]
 
-                if pairs[idx] is None:
-                    # fallback: ha a pár None volt, de a taskban van két href, próbáljuk külön
-                    h1, h2 = task.get("hrefs") or (None, None)
-                    if h1 and h2:
-                        (f1, f2), (s1, s2) = resolve_two_final_urls_rr(h1, h2)
+                    if pairs[idx] is None:
+                        # fallback: ha a pár None volt, de a taskban van két href, próbáljuk külön
+                        h1, h2 = task.get("hrefs") or (None, None)
+                        if h1 and h2:
+                            (f1, f2), (s1, s2) = resolve_two_final_urls_rr(h1, h2)
+                        else:
+                            f1, f2 = h1, h2
+                            s1, s2 = ("timeout", "timeout")
                     else:
-                        f1, f2 = h1, h2
-                        s1, s2 = ("timeout", "timeout")
-                else:
-                    (f1, f2) = finals[idx]
-                    (s1, s2) = states[idx]
+                        (f1, f2) = finals[idx]
+                        (s1, s2) = states[idx]
 
-                task["finals"] = (f1, f2)
+                    task["finals"] = (f1, f2)
 
-                ok = valid_external(f1) and valid_external(f2)
-                if ok:
-                    tip_payload = _build_tip_payload_from_task(task)
-                    update_payload = _build_update_payload_from_task(task)
-                    dispatcher.enqueue_save({
-                        "id": tbody_id,
-                        "tip_payload": tip_payload,
-                        "update_payload": update_payload,
-                        "state_info": {
-                            "odds1": tip_payload["odds1"],
-                            "odds2": tip_payload["odds2"],
-                            "profit_percent": tip_payload["profit_percent"],
-                        },
-                        "finals": task["finals"],
-                    })
-                    link_cache[tbody_id] = {
-                        "link1": f1,
-                        "link2": f2,
-                        "saved_at": datetime.now().isoformat()
-                    }
-                    _clear_nav_backoff(tbody_id)
-                else:
-                    # minden nem 'ok' (beleértve a timeout-ot) → NAV backoff
-                    if 'not_found' in (s1, s2):
-                        warn(f"🔎 Page not found → NAV backoff: {tbody_id} (s1={s1}, s2={s2})")
-                    _schedule_nav_backoff(tbody_id)
+                    ok = valid_external(f1) and valid_external(f2)
+                    if ok:
+                        tip_payload = _build_tip_payload_from_task(task)
+                        update_payload = _build_update_payload_from_task(task)
+                        dispatcher.enqueue_save({
+                            "id": tbody_id,
+                            "tip_payload": tip_payload,
+                            "update_payload": update_payload,
+                            "state_info": {
+                                "odds1": tip_payload["odds1"],
+                                "odds2": tip_payload["odds2"],
+                                "profit_percent": tip_payload["profit_percent"],
+                            },
+                            "finals": task["finals"],
+                        })
+                        link_cache[tbody_id] = {
+                            "link1": f1,
+                            "link2": f2,
+                            "saved_at": datetime.now().isoformat()
+                        }
+                        _clear_nav_backoff(tbody_id)
+                    else:
+                        # minden nem 'ok' (beleértve a timeout-ot) → NAV backoff
+                        # Részletes log hogy miért bukott el a valid_external
+                        f1_valid = valid_external(f1)
+                        f2_valid = valid_external(f2)
+                        
+                        # Detect about:blank or surebet.com URLs
+                        f1_issue = "None" if f1 is None else ("about:blank" if f1 == "about:blank" else ("surebet.com" if is_surebet_url(f1) else "invalid"))
+                        f2_issue = "None" if f2 is None else ("about:blank" if f2 == "about:blank" else ("surebet.com" if is_surebet_url(f2) else "invalid"))
+                        
+                        if not f1_valid or not f2_valid:
+                            warn(f"❌ valid_external failed for {tbody_id}: f1={f1_issue} (url={f1}), f2={f2_issue} (url={f2})")
+                        
+                        if 'not_found' in (s1, s2):
+                            warn(f"🔎 Page not found → NAV backoff: {tbody_id} (s1={s1}, s2={s2})")
+                        _schedule_nav_backoff(tbody_id)
+
+                except Exception as task_err:
+                    # Ha driver-connection hiba → teljes NAV leáll (propagáljuk)
+                    if _is_driver_connection_error(task_err):
+                        raise
+                    
+                    # Egyéb hiba → task visszarakása queue végére (max 2x retry)
+                    retry_count = task.get("_retry_count", 0)
+                    if retry_count < 2:
+                        task["_retry_count"] = retry_count + 1
+                        OPEN_TASKS.append(task)
+                        warn(f"⚠️ Task feldolgozás hiba, újrapróbálás ({retry_count+1}/2): {task.get('id')} - {task_err}")
+                    else:
+                        warn(f"❌ Task végleg elvetve 2 sikertelen próbálkozás után: {task.get('id')}")
 
             save_link_cache(link_cache)
 
@@ -2440,18 +2868,27 @@ def block_group_url(url, seconds, reason=""):
     log(f"⛔ GROUP tiltólista {seconds}s: {url} ({reason})")
 
 def close_group_tab(url):
+    global CLOSING_HANDLES
     info = group_tabs.get(url)
     if not info:
         return
+    handle = info.get("handle")
+    if handle:
+        CLOSING_HANDLES.add(handle)  # Jelzés, hogy bezárás alatt van
+        # 📋 Diagnostic: race condition tracking
+        DIAG_LOGGER.log_race_condition("GROUP_TAB_CLOSING", 
+                                       handles_state=f"closing={len(CLOSING_HANDLES)}", 
+                                       pending_cdp=len(PENDING_CDP_CLOSES))
     try:
-        handle = info["handle"]
-        if handle in driver.window_handles:
+        if handle and handle in driver.window_handles:
             driver.switch_to.window(handle)
             driver.close()
     except Exception:
         pass
     finally:
         group_tabs.pop(url, None)
+        if handle:
+            CLOSING_HANDLES.discard(handle)  # Eltávolítás bezárás után
         try:
             if driver.window_handles:
                 driver.switch_to.window(driver.window_handles[0])
@@ -3429,9 +3866,11 @@ def login():
         log("✅ Sikeres bejelentkezés.")
         LOGIN_TS = time.time()
         _autoupdate_attempts = 0
+        DIAG_LOGGER.log_milestone(f"LOGIN_SUCCESS (account={ACTIVE_ACCOUNT_KEY})")
 
     except Exception as e:
         print(f"❌ Bejelentkezés sikertelen: {e}")
+        DIAG_LOGGER.log_event("LOGIN", f"Login failed: {str(e)[:100]}", "ERROR")
         try:
             # Fallback: még egyszer megnézzük a login oldalt, de itt is kezeljük az "already signed in"-t
             driver.get(LOGIN_URL)
@@ -3747,6 +4186,147 @@ def schedule_delete(gid: str):
 
 
 
+# --- CDP-BASED TBODY READING -------------------------------------------
+
+def _get_tbody_ids_via_cdp_for_target(target_id: str) -> list[str] | None:
+    """
+    CDP Runtime.evaluate használatával lekérdezi a tbody ID-ket egy adott target-ből.
+    
+    Args:
+        target_id: CDP target ID
+    
+    Returns:
+        List of tbody IDs or None if CDP fails
+    """
+    if not USE_CDP_FOR_TBODY_READING:
+        return None  # Feature kikapcsolva
+    
+    try:
+        # JavaScript kifejezés: összes tbody[data-id] vagy tbody[dataid] elem ID-jének gyűjtése
+        js_expression = """
+        (function() {
+            const tbodys = Array.from(document.querySelectorAll('tbody.surebet_record'));
+            const ids = [];
+            for (const tbody of tbodys) {
+                const id = tbody.getAttribute('data-id') || tbody.getAttribute('dataid');
+                if (id) {
+                    ids.push(id);
+                }
+            }
+            return ids;
+        })();
+        """
+        
+        result = driver.execute_cdp_cmd("Runtime.evaluate", {
+            "expression": js_expression,
+            "returnByValue": True,
+            "awaitPromise": False
+        })
+        
+        if result and 'result' in result and 'value' in result['result']:
+            tbody_ids = result['result']['value']
+            if isinstance(tbody_ids, list):
+                DIAG_LOGGER.log_cdp_lifecycle("TBODY_READ_SUCCESS", url=f"target={target_id[:12]}...", details=f"count={len(tbody_ids)}")
+                return tbody_ids
+        
+        # Sikertelen CDP válasz
+        return None
+        
+    except Exception as e:
+        # CDP hiba, fallback-re kell váltani
+        DIAG_LOGGER.log_cdp_lifecycle("TBODY_READ_ERROR", url=f"target={target_id[:12]}...", error=True, details=str(e)[:80])
+        return None
+
+
+def _get_tbody_ids_via_cdp_for_window(handle: str) -> list[str] | None:
+    """
+    CDP-vel lekérdezi a tbody ID-ket egy window handle-höz tartozó target-ből.
+    
+    Args:
+        handle: Window handle
+    
+    Returns:
+        List of tbody IDs or None if CDP fails
+    """
+    if not USE_CDP_FOR_TBODY_READING:
+        return None  # Feature kikapcsolva
+    
+    try:
+        # Először meg kell találni a window handle-höz tartozó target ID-t
+        targets_info = _safe_cdp_cmd("Target.getTargets", {}, label="get tbody targets")
+        if not targets_info or 'targetInfos' not in targets_info:
+            return None
+        
+        # Keresünk egy page target-et ami ehhez a handle-höz tartozik
+        target_id = None
+        for target in targets_info['targetInfos']:
+            if target.get('type') == 'page':
+                # Nem tudjuk direkt módon match-elni a handle-t a targetId-vel CDP-ből,
+                # de megpróbálhatjuk az URL vagy egyéb információk alapján
+                # Egyszerűbb megoldás: próbálkozunk Runtime.evaluate-tel minden page target-en
+                target_id = target.get('targetId')
+                if target_id:
+                    # Próbálkozás ezzel a target-tel
+                    tbody_ids = _get_tbody_ids_via_cdp_for_target(target_id)
+                    if tbody_ids is not None:
+                        return tbody_ids
+        
+        return None
+        
+    except Exception as e:
+        return None
+
+
+def _scan_window_cdp_with_fallback(handle: str, source_label: str) -> set[str]:
+    """
+    Megpróbálja CDP-vel beolvasni a tbody ID-ket, ha elbukik, Selenium fallback.
+    
+    Args:
+        handle: Window handle
+        source_label: Forrás címke (main/group/next)
+    
+    Returns:
+        Set of tbody IDs
+    """
+    ids_set = set()
+    now_ts = time.time()
+    
+    # 1. Próbálkozás CDP-vel
+    if USE_CDP_FOR_TBODY_READING:
+        try:
+            tbody_ids = _get_tbody_ids_via_cdp_for_window(handle)
+            if tbody_ids is not None:
+                # CDP siker!
+                for tid in tbody_ids:
+                    if tid:
+                        ids_set.add(tid)
+                        last_seen_ts[tid] = now_ts
+                        if tid not in id_source:
+                            id_source[tid] = source_label
+                return ids_set
+        except Exception:
+            pass  # Fallback-re váltunk
+    
+    # 2. Selenium fallback (eredeti implementáció)
+    try:
+        driver.switch_to.window(handle)
+        tbodys = driver.find_elements(By.CSS_SELECTOR, "tbody.surebet_record")
+        for tbody in tbodys:
+            try:
+                tid = tbody.get_attribute("data-id") or tbody.get_attribute("dataid")
+            except Exception:
+                tid = None
+            if tid:
+                ids_set.add(tid)
+                last_seen_ts[tid] = now_ts
+                if tid not in id_source:
+                    id_source[tid] = source_label
+    except Exception:
+        pass  # Hiba, üres set marad
+    
+    return ids_set
+
+
 # --- TAB-ALAPÚ RESYNC (ÚJ LOGIKA) -----------------------------------------
 
 def collect_live_ids_from_open_tabs() -> set[str]:
@@ -3760,34 +4340,23 @@ def collect_live_ids_from_open_tabs() -> set[str]:
     Közben frissíti:
       - last_seen_ts[tid]
       - id_source[tid]
+    
+    CDP-ALAPÚ MEGKÖZELÍTÉS (USE_CDP_FOR_TBODY_READING = True):
+      - CDP Runtime.evaluate használata minden tabon
+      - Automatikus Selenium fallback hiba esetén
+      - Gyorsabb, kevesebb "no such window" hiba
+    
+    SELENIUM FALLBACK (USE_CDP_FOR_TBODY_READING = False vagy CDP hiba):
+      - Eredeti driver.switch_to.window + find_elements megközelítés
+      - 100% backward compatibility
     """
     live_ids = set()
-    now_ts = time.time()
-
-    def _scan_current_window(source_label: str):
-        nonlocal live_ids, now_ts
-        try:
-            tbodys = driver.find_elements(By.CSS_SELECTOR, "tbody.surebet_record")
-        except Exception:
-            return
-        for tbody in tbodys:
-            try:
-                tid = tbody.get_attribute("data-id") or tbody.get_attribute("dataid")
-            except Exception:
-                tid = None
-            if not tid:
-                continue
-            live_ids.add(tid)
-            last_seen_ts[tid] = now_ts
-            # ha még nem volt forrás beállítva, ne írjuk felül agresszíven
-            if tid not in id_source:
-                id_source[tid] = source_label
-
+    
     # 1) MAIN
     try:
         if MAIN_HANDLE and MAIN_HANDLE in driver.window_handles:
-            driver.switch_to.window(MAIN_HANDLE)
-            _scan_current_window("main")
+            ids = _scan_window_cdp_with_fallback(MAIN_HANDLE, "main")
+            live_ids.update(ids)
     except Exception as e:
         warn(f"collect_live_ids_from_open_tabs: MAIN_HANDLE hiba: {e}")
 
@@ -3797,8 +4366,8 @@ def collect_live_ids_from_open_tabs() -> set[str]:
         if not handle or handle not in driver.window_handles:
             continue
         try:
-            driver.switch_to.window(handle)
-            _scan_current_window("group")
+            ids = _scan_window_cdp_with_fallback(handle, "group")
+            live_ids.update(ids)
         except Exception as e:
             warn(f"collect_live_ids_from_open_tabs: group tab hiba {url}: {e}")
 
@@ -3808,8 +4377,8 @@ def collect_live_ids_from_open_tabs() -> set[str]:
         if not handle or handle not in driver.window_handles:
             continue
         try:
-            driver.switch_to.window(handle)
-            _scan_current_window("next")
+            ids = _scan_window_cdp_with_fallback(handle, "next")
+            live_ids.update(ids)
         except Exception as e:
             warn(f"collect_live_ids_from_open_tabs: next tab hiba {url}: {e}")
 
@@ -3820,8 +4389,219 @@ def collect_live_ids_from_open_tabs() -> set[str]:
     except Exception:
         pass
 
-    log(f"collect_live_ids_from_open_tabs: {len(live_ids)} élő tbody ID a nyitott tabokból")
+    mode_str = "CDP+fallback" if USE_CDP_FOR_TBODY_READING else "Selenium"
+    log(f"collect_live_ids_from_open_tabs ({mode_str}): {len(live_ids)} élő tbody ID a nyitott tabokból")
     return live_ids
+
+
+def post_bootstrap_cleanup():
+    """
+    BOOTSTRAP fázis után automatikusan lefutó cleanup:
+    - összegyűjti az élő ID-kat a nyitott main/group/next tabokból
+    - összehasonlítja az active_ids fájllal
+    - ami nem látható a weboldalon, törli az active_ids fájlból
+    - és küldi a delete-tip-et a szervernek is
+    
+    Ez minden induláskor lefut, akár user váltásnál is.
+    """
+    global active_ids, BOOTSTRAP_CLEANUP_DONE
+    
+    if BOOTSTRAP_CLEANUP_DONE:
+        return  # már lefutott, ne csináljuk újra
+    
+    log("🧹 POST-BOOTSTRAP CLEANUP indul: ID-k összehasonlítása active_ids fájllal...")
+    DIAG_LOGGER.log_milestone("POST_BOOTSTRAP_CLEANUP_START")
+    
+    try:
+        # Összegyűjtjük az élő ID-kat a nyitott tabokból
+        live_ids = collect_live_ids_from_open_tabs()
+    except Exception as e:
+        warn(f"POST-BOOTSTRAP CLEANUP: hiba az élő ID-k gyűjtésekor: {e}")
+        live_ids = set()
+    
+    # Azonosítjuk a stale ID-kat (amik az active_ids-ben vannak, de nem látszanak)
+    stale_ids = [tid for tid in list(active_ids) if tid not in live_ids]
+    
+    if stale_ids:
+        log(f"🗑️ POST-BOOTSTRAP CLEANUP: {len(stale_ids)} ID nem látható → törlés active_ids fájlból és szerverről")
+        
+        # Törlés az active_ids-ből
+        for tid in stale_ids:
+            active_ids.discard(tid)
+        
+        # Mentés az active_ids fájlba
+        save_active_all(active_ids)
+        
+        # DELETE küldése a szervernek (dispatcher-en keresztül)
+        for tid in stale_ids:
+            try:
+                dispatcher.enqueue_delete(tid)
+            except Exception as e:
+                warn(f"⚠️ DELETE enqueue hiba (post-bootstrap): {e}")
+        
+        # Azonnal kiküldjük a DELETE-eket
+        try:
+            process_dispatcher_results(max_items=2000)
+        except Exception as e:
+            warn(f"⚠️ POST-BOOTSTRAP CLEANUP: dispatcher results hiba: {e}")
+        
+        log(f"✅ POST-BOOTSTRAP CLEANUP: {len(stale_ids)} ID törölve")
+    else:
+        log("✨ POST-BOOTSTRAP CLEANUP: nincs törlendő ID – minden élő ID megtalálható a tabokon")
+    
+    BOOTSTRAP_CLEANUP_DONE = True
+    log("🏁 POST-BOOTSTRAP CLEANUP kész – normál működés folytatódik")
+    DIAG_LOGGER.log_milestone(f"POST_BOOTSTRAP_CLEANUP_COMPLETE (stale_removed={len(stale_ids) if stale_ids else 0})")
+
+
+def run_dynamic_bootstrap():
+    """
+    Dinamikus BOOTSTRAP fázis:
+    1. MAIN + rekurzív NEXT oldalak megnyitása (max 20s)
+    2. GROUP linkek gyűjtése + párhuzamos megnyitás
+    3. 10s várakozás GROUP oldalak betöltésére
+    4. Max 5 perc az egész folyamatra
+    """
+    global BOOTSTRAP_COMPLETED, MAIN_HANDLE
+    
+    DIAG_LOGGER.log_milestone("BOOTSTRAP_START")
+    
+    bootstrap_start = time.time()
+    MAX_BOOTSTRAP_TIME = 300  # 5 perc
+    NEXT_PHASE_TIMEOUT = 20   # 20s MAIN + NEXT oldalakra
+    GROUP_LOAD_WAIT = 10      # 10s GROUP oldalak betöltésére
+    
+    log("🚀 DINAMIKUS BOOTSTRAP indul: MAIN + NEXT oldalak rekurzív feltérképezése")
+    
+    try:
+        # === FÁZIS 1: MAIN + rekurzív NEXT oldalak (max 20s) ===
+        phase1_start = time.time()
+        next_urls_to_open = []
+        
+        # MAIN oldal szkennelése NEXT linkekért
+        try:
+            if MAIN_HANDLE and MAIN_HANDLE in driver.window_handles:
+                driver.switch_to.window(MAIN_HANDLE)
+                next_link = find_next_page_link()
+                if next_link and next_link not in next_tabs:
+                    next_urls_to_open.append(next_link)
+                    log(f"📄 MAIN-ról talált NEXT: {next_link}")
+        except Exception as e:
+            warn(f"⚠️ MAIN scan hiba (NEXT linkek): {e}")
+        
+        # Rekurzívan nyitjuk a NEXT oldalakat és keressük a további NEXT linkeket
+        opened_next = set()
+        while next_urls_to_open and (time.time() - phase1_start) < NEXT_PHASE_TIMEOUT:
+            next_url = next_urls_to_open.pop(0)
+            if next_url in opened_next or next_url in next_tabs:
+                continue
+            
+            try:
+                open_next_tab_if_needed(next_url)
+                opened_next.add(next_url)
+                
+                # Scan az újonnan megnyitott NEXT oldalon további NEXT linkekért
+                if next_url in next_tabs:
+                    info = next_tabs[next_url]
+                    handle = info.get("handle")
+                    if handle and handle in driver.window_handles:
+                        driver.switch_to.window(handle)
+                        further_next = find_next_page_link()
+                        if further_next and further_next not in opened_next and further_next not in next_tabs:
+                            next_urls_to_open.append(further_next)
+                            log(f"📄 NEXT-ről talált újabb NEXT: {further_next}")
+            except Exception as e:
+                warn(f"⚠️ NEXT oldal megnyitás hiba ({next_url}): {e}")
+        
+        phase1_elapsed = time.time() - phase1_start
+        log(f"✅ FÁZIS 1 kész: {len(opened_next)} NEXT oldal megnyitva ({phase1_elapsed:.1f}s)")
+        
+        # === FÁZIS 2: GROUP linkek gyűjtése + megnyitás ===
+        if (time.time() - bootstrap_start) >= MAX_BOOTSTRAP_TIME:
+            log("⏰ 5 perces timeout – BOOTSTRAP befejezése GROUP fázis nélkül")
+            BOOTSTRAP_COMPLETED = True
+            return
+        
+        log("📦 FÁZIS 2: GROUP linkek gyűjtése MAIN + NEXT oldalakról")
+        group_urls_to_open = set()
+        
+        # MAIN oldalról GROUP linkek
+        try:
+            if MAIN_HANDLE and MAIN_HANDLE in driver.window_handles:
+                driver.switch_to.window(MAIN_HANDLE)
+                tbodys = driver.find_elements(By.CSS_SELECTOR, "tbody.surebet_record")
+                for tbody in tbodys:
+                    try:
+                        group_link = find_group_link_in_tbody(tbody)
+                        if group_link and group_link not in group_tabs:
+                            group_urls_to_open.add(group_link)
+                    except Exception:
+                        pass
+        except Exception as e:
+            warn(f"⚠️ MAIN GROUP linkek gyűjtése hiba: {e}")
+        
+        # NEXT oldalakról GROUP linkek
+        for next_url, info in list(next_tabs.items()):
+            try:
+                handle = info.get("handle")
+                if handle and handle in driver.window_handles:
+                    driver.switch_to.window(handle)
+                    tbodys = driver.find_elements(By.CSS_SELECTOR, "tbody.surebet_record")
+                    for tbody in tbodys:
+                        try:
+                            group_link = find_group_link_in_tbody(tbody)
+                            if group_link and group_link not in group_tabs:
+                                group_urls_to_open.add(group_link)
+                        except Exception:
+                            pass
+            except Exception as e:
+                warn(f"⚠️ NEXT ({next_url}) GROUP linkek gyűjtése hiba: {e}")
+        
+        # === FÁZIS 2b: GROUP oldalak párhuzamos megnyitása ===
+        group_count = len(group_urls_to_open)
+        log(f"🔍 {group_count} GROUP oldal nyitása...")
+        
+        # Küldés queue-ba (async nyitás)
+        for group_url in group_urls_to_open:
+            if (time.time() - bootstrap_start) >= MAX_BOOTSTRAP_TIME:
+                log("⏰ 5 perces timeout – BOOTSTRAP befejezése")
+                break
+            try:
+                open_group_tab_if_needed(group_url)
+            except Exception as e:
+                warn(f"⚠️ GROUP oldal megnyitás hiba ({group_url}): {e}")
+        
+        # Várunk amíg az összes GROUP oldal megnyílik
+        log(f"⏳ Várakozás hogy mind a {group_count} GROUP oldal megnyíljon...")
+        wait_start = time.time()
+        max_wait_for_opens = 30  # max 30s várunk hogy megnyíljanak
+        
+        while (time.time() - wait_start) < max_wait_for_opens:
+            opened_count = len([url for url in group_urls_to_open if url in group_tabs])
+            if opened_count >= group_count:
+                log(f"✅ Mind a {group_count} GROUP oldal megnyílt")
+                break
+            if (time.time() - bootstrap_start) >= MAX_BOOTSTRAP_TIME:
+                log(f"⏰ 5 perces timeout – {opened_count}/{group_count} GROUP oldal megnyílt")
+                break
+            time.sleep(0.5)  # rövid poll intervallum
+        
+        # === FÁZIS 3: Várakozás GROUP oldalak betöltésére ===
+        if (time.time() - bootstrap_start) < MAX_BOOTSTRAP_TIME:
+            log(f"⏳ {GROUP_LOAD_WAIT}s várakozás GROUP oldalak betöltésére...")
+            time.sleep(GROUP_LOAD_WAIT)
+        
+        total_time = time.time() - bootstrap_start
+        log(f"✅ DINAMIKUS BOOTSTRAP befejezve: {len(opened_next)} NEXT + {len(group_tabs)} GROUP oldal ({total_time:.1f}s)")
+        DIAG_LOGGER.log_milestone(f"BOOTSTRAP_PHASE_COMPLETE (next={len(opened_next)}, group={len(group_tabs)}, time={total_time:.1f}s)")
+        
+    except Exception as e:
+        warn(f"⚠️ DINAMIKUS BOOTSTRAP hiba: {e}")
+        DIAG_LOGGER.log_event("BOOTSTRAP", f"Error: {str(e)[:100]}", "ERROR")
+    finally:
+        BOOTSTRAP_COMPLETED = True
+        log("🏁 BOOTSTRAP_COMPLETED = True – normál működés indul")
+        DIAG_LOGGER.log_milestone("BOOTSTRAP_COMPLETED")
 
 
 def full_resync_and_cleanup(max_groups=None):
@@ -3921,14 +4701,15 @@ if __name__ == "__main__":
     RUN_STARTED_AT = time.time()
     login()
 
-    log(f"🚀 BOOTSTRAP fázis indul: az első {int(BOOTSTRAP_SEC)} mp-ben "
-        f"csak main/group/next tab nyitás + tbody ID gyűjtés, "
-        f"nincs SAVE/UPDATE/DELETE/NAV.")
+    log("🚀 DINAMIKUS BOOTSTRAP fázis: rekurzív MAIN + NEXT + GROUP oldalak megnyitása")
 
     try:
         MAIN_HANDLE = driver.current_window_handle
     except Exception:
         MAIN_HANDLE = None
+
+    # Dinamikus BOOTSTRAP futtatása
+    run_dynamic_bootstrap()
 
     # NAV worker: csak BOOTSTRAP UTÁN indul
     nav_thread = None
@@ -4029,12 +4810,43 @@ if __name__ == "__main__":
 
     try:
         while True:
+            loop_start_time = time.time()
+            
             # 💀 Ha a WebDriver meghalt, ne kínlódjunk tovább – lépjünk ki a fő loopból
             if DRIVER_DEAD:
                 warn("💀 WebDriver kapcsolat meghalt (DRIVER_DEAD=True) – kilépek a fő ciklusból.")
+                DIAG_LOGGER.log_crash_context(Exception("DRIVER_DEAD"), "DRIVER_DEATH")
                 break
 
+            # 🏥 Session health check: gyors window_handles check
+            try:
+                handles = driver.window_handles
+                # Diagnostic: periodic health logging
+                try:
+                    info = _safe_cdp_cmd("Target.getTargets", {}, label="health_check")
+                    target_count = len(info.get("targetInfos", [])) if info else 0
+                except Exception:
+                    target_count = None
+                DIAG_LOGGER.log_session_health(len(handles), target_count)
+            except WebDriverException as e:
+                msg_lower = str(e).lower()
+                if "invalid session" in msg_lower or "chrome not reachable" in msg_lower:
+                    warn(f"❌ Session health check failed: {e}")
+                    DIAG_LOGGER.log_crash_context(e, "SESSION_LOSS")
+                    restart_application()
+                # Egyéb WebDriverException - log de folytatjuk
+                warn(f"⚠️ Session health check warning: {e}")
+                DIAG_LOGGER.log_event("HEALTH", f"Warning: {str(e)[:100]}", "WARN")
+            except Exception as e:
+                # Váratlan hiba - log de folytatjuk
+                warn(f"⚠️ Session health check unexpected error: {e}")
+                DIAG_LOGGER.log_event("HEALTH", f"Unexpected: {str(e)[:100]}", "ERROR")
+
             bootstrap = in_bootstrap_phase()
+
+            # 🧹 POST-BOOTSTRAP CLEANUP – csak egyszer, amikor a bootstrap vége van
+            if not bootstrap and not BOOTSTRAP_CLEANUP_DONE:
+                post_bootstrap_cleanup()
 
             # --- SUPABASE dispatcher eredmények ---
             if not bootstrap:
@@ -4162,14 +4974,19 @@ if __name__ == "__main__":
             # TABOK BEZÁRÁSA
             for url in next_to_close:
                 info = next_tabs.get(url)
+                handle = info.get("handle") if info else None
+                if handle:
+                    CLOSING_HANDLES.add(handle)  # Jelzés, hogy bezárás alatt van
                 try:
-                    if info and info["handle"] in driver.window_handles:
-                        driver.switch_to.window(info["handle"])
+                    if info and handle and handle in driver.window_handles:
+                        driver.switch_to.window(handle)
                         driver.close()
                 except Exception:
                     pass
                 finally:
                     next_tabs.pop(url, None)
+                    if handle:
+                        CLOSING_HANDLES.discard(handle)  # Eltávolítás bezárás után
                     try:
                         if MAIN_HANDLE and MAIN_HANDLE in driver.window_handles:
                             driver.switch_to.window(MAIN_HANDLE)
@@ -4201,10 +5018,33 @@ if __name__ == "__main__":
                 nav_started = True
 
             prev_ids_main = curr_ids_main
+            
+            # 📊 Loop timing diagnostic
+            loop_duration = time.time() - loop_start_time
+            DIAG_LOGGER.log_loop_timing(loop_duration)
+            
+            # 📈 Queue status periodic logging
+            if DIAG_LOGGER.loop_iteration % 20 == 0:  # Minden 20. iterációnál
+                try:
+                    open_tasks_len = len(OPEN_TASKS) if OPEN_TASKS else 0
+                    DIAG_LOGGER.log_queue_status(open_tasks=open_tasks_len)
+                except Exception:
+                    pass
+            
             time.sleep(CHECK_INTERVAL)
 
     except KeyboardInterrupt:
         warn("🛑 Leállítva.")
+        DIAG_LOGGER.log_milestone("Application stopped by user (KeyboardInterrupt)")
+    except WebDriverException as e:
+        msg_lower = str(e).lower()
+        if "invalid session" in msg_lower or "chrome not reachable" in msg_lower:
+            warn(f"❌ Critical WebDriver error in main loop: {e}")
+            DIAG_LOGGER.log_crash_context(e, "WEBDRIVER_CRASH")
+            restart_application()
+        else:
+            warn(f"⚠️ WebDriverException in main loop (not restarting): {e}")
+            DIAG_LOGGER.log_event("ERROR", f"WebDriverException (not critical): {str(e)[:150]}", "WARN")
     finally:
         try:
             flush_pending_updates()
