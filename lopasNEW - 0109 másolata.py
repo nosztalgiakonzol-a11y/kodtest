@@ -2195,8 +2195,8 @@ def resolve_pairs_round_robin(pairs) -> tuple[list[tuple[str | None, str | None]
                             })
                             page_not_found = result.get("result", {}).get("value", False)
                         except Exception as e:
-                            # CDP elbukott, fallback 10s után Selenium-mal
-                            if time_open >= 10.0:
+                            # CDP elbukott, fallback 7s után Selenium-mal
+                            if time_open >= 7.0:
                                 try:
                                     # Selenium fallback: switch to window és kiolvasni a szöveget
                                     target_info = driver.execute_cdp_cmd("Target.getTargetInfo", {"targetId": tid})
