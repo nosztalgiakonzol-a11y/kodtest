@@ -2173,15 +2173,57 @@ def resolve_pairs_round_robin(pairs) -> tuple[list[tuple[str | None, str | None]
 
             # csak akkor tekintjük késznek, ha már elhagyta a surebet.com-ot
             if not valid_external(url):
-                # Early detection: ha surebet.com-on van még egy ideig
-                # Ellenőrizzük hogy mennyi ideje nyitott már
+                # Early detection: ha surebet.com-on van és "Page not found" szöveg található
                 if is_surebet_url(url):
                     entry = tracking.get(tid)
                     if entry:
                         time_open = now - entry.get("start_time", now)
-                        # Ha már 3+ másodperce nyitott és még mindig surebet.com-on van
-                        # → valószínűleg nem fog sikerülni a navigáció
-                        if time_open >= 3.0:
+                        
+                        # 1. Próbáljuk CDP-vel kiolvasni a "Page not found" szöveget
+                        page_not_found = False
+                        try:
+                            result = driver.execute_cdp_cmd("Runtime.evaluate", {
+                                "expression": """
+                                (function() {
+                                    var text = document.body ? document.body.innerText.toLowerCase() : '';
+                                    return text.includes('page not found') || 
+                                           text.includes('404') ||
+                                           text.includes('not found');
+                                })()
+                                """,
+                                "returnByValue": True
+                            })
+                            page_not_found = result.get("result", {}).get("value", False)
+                        except Exception as e:
+                            # CDP elbukott, fallback 10s után Selenium-mal
+                            if time_open >= 10.0:
+                                try:
+                                    # Selenium fallback: switch to window és kiolvasni a szöveget
+                                    target_info = driver.execute_cdp_cmd("Target.getTargetInfo", {"targetId": tid})
+                                    if target_info and "targetInfo" in target_info:
+                                        page_id = target_info["targetInfo"].get("targetId")
+                                        # Megpróbáljuk megtalálni a window handle-t
+                                        for handle in driver.window_handles:
+                                            try:
+                                                driver.switch_to.window(handle)
+                                                current_url = driver.current_url
+                                                if is_surebet_url(current_url):
+                                                    body_text = driver.find_element(By.TAG_NAME, "body").text.lower()
+                                                    if "page not found" in body_text or "404" in body_text or "not found" in body_text:
+                                                        page_not_found = True
+                                                    break
+                                            except:
+                                                pass
+                                        # Switch vissza MAIN-re
+                                        try:
+                                            driver.switch_to.window(MAIN_HANDLE)
+                                        except:
+                                            pass
+                                except Exception as sel_err:
+                                    pass  # Selenium fallback is elbukott
+                        
+                        # Ha megtaláltuk a "Page not found" szöveget → complete
+                        if page_not_found:
                             ready_state_cache[tid] = "complete"
                         else:
                             ready_state_cache[tid] = ""
@@ -2256,7 +2298,7 @@ def resolve_pairs_round_robin(pairs) -> tuple[list[tuple[str | None, str | None]
             ready_state_cache.pop(tid1, None)
             ready_state_cache.pop(tid2, None)
             
-            warn(f"[RR] ⚠️ Early timeout (idx={pair_idx}): mindkét oldal complete de surebet.com-on maradt")
+            warn(f"[RR] ⚠️ Early timeout (idx={pair_idx}): mindkét oldal 'Page not found' → surebet.com-on maradt")
 
         # debug log 2 mp-enként (ha engedélyezve)
         if NAV_DEBUG_INTERVAL > 0 and (time.time() - last_dbg) >= NAV_DEBUG_INTERVAL:
