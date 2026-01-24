@@ -2180,48 +2180,40 @@ def resolve_pairs_round_robin(pairs) -> tuple[list[tuple[str | None, str | None]
                         now = time.time()
                         time_open = now - entry.get("start_time", now)
                         
-                        # 1. Próbáljuk CDP-vel kiolvasni a "Page not found" szöveget
+                        # Csak 7s után ellenőrizzük a "Page not found" szöveget Selenium-mal
                         page_not_found = False
-                        try:
-                            result = driver.execute_cdp_cmd("Runtime.evaluate", {
-                                "expression": """
-                                (function() {
-                                    var text = document.body ? document.body.innerText.toLowerCase() : '';
-                                    return text.includes('page not found') || 
-                                           text.includes('404') ||
-                                           text.includes('not found');
-                                })()
-                                """,
-                                "returnByValue": True
-                            })
-                            page_not_found = result.get("result", {}).get("value", False)
-                        except Exception as e:
-                            # CDP elbukott, fallback 7s után Selenium-mal
-                            if time_open >= 7.0:
+                        if time_open >= 7.0:
+                            try:
+                                # Selenium window switch: végigmegyünk az összes window-n
+                                saved_handle = None
                                 try:
-                                    # Selenium fallback: switch to window és kiolvasni a szöveget
-                                    target_info = driver.execute_cdp_cmd("Target.getTargetInfo", {"targetId": tid})
-                                    if target_info and "targetInfo" in target_info:
-                                        page_id = target_info["targetInfo"].get("targetId")
-                                        # Megpróbáljuk megtalálni a window handle-t
-                                        for handle in driver.window_handles:
-                                            try:
-                                                driver.switch_to.window(handle)
-                                                current_url = driver.current_url
-                                                if is_surebet_url(current_url):
-                                                    body_text = driver.find_element(By.TAG_NAME, "body").text.lower()
-                                                    if "page not found" in body_text or "404" in body_text or "not found" in body_text:
-                                                        page_not_found = True
-                                                    break
-                                            except:
-                                                pass
-                                        # Switch vissza MAIN-re
-                                        try:
-                                            driver.switch_to.window(MAIN_HANDLE)
-                                        except:
-                                            pass
-                                except Exception as sel_err:
-                                    pass  # Selenium fallback is elbukott
+                                    saved_handle = driver.current_window_handle
+                                except:
+                                    pass
+                                
+                                for handle in driver.window_handles:
+                                    try:
+                                        driver.switch_to.window(handle)
+                                        current_url = driver.current_url
+                                        # Ha ez az URL egy surebet.com oldal
+                                        if is_surebet_url(current_url):
+                                            body_text = driver.find_element(By.TAG_NAME, "body").text.lower()
+                                            if "page not found" in body_text or "404" in body_text or "not found" in body_text:
+                                                page_not_found = True
+                                                break
+                                    except:
+                                        pass
+                                
+                                # Switch vissza az eredeti handle-re vagy MAIN-re
+                                try:
+                                    if saved_handle:
+                                        driver.switch_to.window(saved_handle)
+                                    else:
+                                        driver.switch_to.window(MAIN_HANDLE)
+                                except:
+                                    pass
+                            except Exception as sel_err:
+                                pass  # Selenium check elbukott
                         
                         # Ha megtaláltuk a "Page not found" szöveget → complete
                         if page_not_found:
